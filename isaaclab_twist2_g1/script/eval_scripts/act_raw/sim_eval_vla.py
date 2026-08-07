@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import torch
 import argparse
 import gc
 import json
@@ -38,7 +38,7 @@ def _load_simple_video_recorder():
         return module.SimpleVideoRecorder
 
 
-TASK_FOOTBALL_SINGLE = "Isaac-Move-Football-Single-G129-Dex3-Wholebody"
+TASK_DOUBLE_DESK = "Isaac-Move-PickPlace-DoubleDesk-G129-Dex3-Wholebody"
 _INTERRUPT_REASON = "unknown"
 
 
@@ -54,9 +54,9 @@ def _install_interrupt_handlers():
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Single-episode or seed-batched VLA evaluation for football-single")
-    parser.add_argument("--task", type=str, default=TASK_FOOTBALL_SINGLE)
-    parser.add_argument("--env_config_yaml", type=str, default="tasks/common_test_config/base_test/football_single_sonic_test.yaml", help="YAML file with env config overrides")
+    parser = argparse.ArgumentParser(description="Single-episode or seed-batched ACT raw107 evaluation for DoubleDesk")
+    parser.add_argument("--task", type=str, default=TASK_DOUBLE_DESK)
+    parser.add_argument("--env_config_yaml", type=str, default="tasks/common_test_config/base_test/doubledesk_sonic_test.yaml", help="YAML file with env config overrides")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--repeat_idx", type=int, default=0)
     parser.add_argument("--episode_seed", type=int, default=None)
@@ -85,6 +85,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lerobot_server_timeout", type=float, default=5.0)
     parser.add_argument("--lerobot_server_verify_ssl", action="store_true", default=False)
     parser.add_argument("--lerobot_gripper_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--sonic_vla_action_format",
+        type=str,
+        default=os.environ.get("SONIC_VLA_ACTION_FORMAT", "raw107"),
+        choices=["semantic_v3", "latent64", "raw107"],
+    )
+    parser.add_argument(
+        "--sonic_raw107_body_source",
+        type=str,
+        default=os.environ.get("SONIC_RAW107_BODY_SOURCE", "native_decoder"),
+        choices=["native_decoder", "direct_raw"],
+    )
     parser.add_argument("--robot_type", type=str, default="unitree_g1_refpose_v3_1")
     parser.add_argument("--result_json", type=str, default="")
     parser.add_argument("--success_video_dir", type=str, default="")
@@ -171,7 +183,10 @@ def _normalize_control_routing(args):
     args.action_source = "sonic_wholebody"
     args.enable_wholebody_dds = True
     args.enable_dex1_dds = False
-    args.enable_dex3_dds = True
+    # Keep Dex3 joints active, but do not create/subscribe to the Dex3 DDS
+    # command channel: raw107 action[93:107] is the sole hand command source.
+    args.enable_dex3_dds = False
+    args.enable_dex3_model_control = True
     args.enable_inspire_dds = False
     args.replay_file = ""
     args.replay_mode = "inference_replay"
@@ -619,6 +634,8 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "video_path": video_path,
         "video_recorded": bool(video_path),
         "server_url": server_url,
+        "sonic_vla_action_format": str(args_cli.sonic_vla_action_format),
+        "sonic_raw107_body_source": str(args_cli.sonic_raw107_body_source),
         "started_at": started_at,
         "finished_at": time.time(),
         "duration_sec": time.time() - started_at,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import torch
 import argparse
 import gc
 import json
@@ -38,7 +38,7 @@ def _load_simple_video_recorder():
         return module.SimpleVideoRecorder
 
 
-TASK_FOOTBALL_SINGLE = "Isaac-Move-Football-Single-G129-Dex3-Wholebody"
+TASK_DOUBLE_DESK = "Isaac-Move-PickPlace-DoubleDesk-G129-Dex3-Wholebody"
 _INTERRUPT_REASON = "unknown"
 
 
@@ -54,9 +54,9 @@ def _install_interrupt_handlers():
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Single-episode or seed-batched VLA evaluation for football-single")
-    parser.add_argument("--task", type=str, default=TASK_FOOTBALL_SINGLE)
-    parser.add_argument("--env_config_yaml", type=str, default="tasks/common_test_config/base_test/football_single_sonic_test.yaml", help="YAML file with env config overrides")
+    parser = argparse.ArgumentParser(description="Aligned ACT ref-pose evaluation for DoubleDesk")
+    parser.add_argument("--task", type=str, default=TASK_DOUBLE_DESK)
+    parser.add_argument("--env_config_yaml", type=str, default="tasks/common_env_config/doubledesk_sonic.yaml", help="YAML file with env config overrides")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--repeat_idx", type=int, default=0)
     parser.add_argument("--episode_seed", type=int, default=None)
@@ -103,6 +103,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_label", type=str, default="")
     parser.add_argument("--eval_model_path", type=str, default="")
     parser.add_argument("--recording_save_dir", type=str, default="")
+    parser.add_argument(
+        "--act_refpose_history_steps",
+        type=int,
+        default=10,
+        help="Number of consecutive control-rate states sent to ACT (training uses 10).",
+    )
+    parser.add_argument(
+        "--act_refpose_execute_steps",
+        type=int,
+        default=5,
+        help="Execute only this prefix of each predicted chunk before replanning.",
+    )
+    parser.add_argument(
+        "--act_refpose_record_full_chunks",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Record complete predicted chunks and boundary metrics in the VLA trace.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     return parser
 
@@ -624,6 +643,9 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "duration_sec": time.time() - started_at,
         "episode_object_seed": get_current_episode_object_seed_info(env.cfg).get("seed") if env is not None else None,
         "episode_object_seed_source": get_current_episode_object_seed_info(env.cfg).get("source") if env is not None else "",
+        "act_refpose_history_steps": int(args_cli.act_refpose_history_steps),
+        "act_refpose_execute_steps": int(args_cli.act_refpose_execute_steps),
+        "act_refpose_record_full_chunks": bool(args_cli.act_refpose_record_full_chunks),
     }
     if error:
         payload["error"] = error
@@ -858,6 +880,7 @@ def main() -> int:
     import gymnasium as gym
 
     import tasks
+    from act_refpose_alignment import configure_act_refpose_alignment
     from action_provider.create_action_provider import create_action_provider
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
     from layeredcontrol.robot_control_system import ControlConfig, RobotController
@@ -915,6 +938,12 @@ def main() -> int:
             _log_verbose(args_cli, "[sim_eval_vla] startup checkpoint=after_create_action_provider")
             if action_provider is None:
                 raise RuntimeError("failed to create action provider")
+            configure_act_refpose_alignment(
+                action_provider,
+                history_steps=args_cli.act_refpose_history_steps,
+                execute_steps=args_cli.act_refpose_execute_steps,
+                record_full_chunks=bool(args_cli.act_refpose_record_full_chunks),
+            )
             _disable_action_provider_internal_recording(action_provider)
             env.action_provider = action_provider
 

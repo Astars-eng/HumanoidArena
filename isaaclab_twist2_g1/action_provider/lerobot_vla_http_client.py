@@ -68,6 +68,7 @@ class LeRobotVLAHttpClient:
         observation_state: np.ndarray,
         robot_type: str,
         task: str | None = None,
+        observation_components: dict[str, np.ndarray] | None = None,
     ) -> np.ndarray:
         rgb = np.asarray(front_rgb)
         state = np.asarray(observation_state, dtype=np.float32).reshape(-1)
@@ -86,6 +87,14 @@ class LeRobotVLAHttpClient:
             "robot_type": robot_type,
             "return_chunk": True,
         }
+        # [interface conversion] Some checkpoints concatenate named robot-state
+        # fields in their own preprocessor.  Carry those fields alongside the
+        # canonical flat state; no task or environment state is added here.
+        if observation_components:
+            payload["observation"]["state_components"] = {
+                str(key): np.asarray(value, dtype=np.float32).reshape(-1).tolist()
+                for key, value in observation_components.items()
+            }
         if task_name:
             payload["task"] = task_name
         response = self._post_json("/infer", payload)
@@ -126,6 +135,64 @@ class LeRobotVLAHttpClient:
         )
         self._trace_step_idx += 1
         return action_chunk
+
+    def infer_single(
+        self,
+        front_rgb: np.ndarray,
+        observation_state: np.ndarray,
+        robot_type: str,
+        task: str | None = None,
+        observation_components: dict[str, np.ndarray] | None = None,
+    ) -> np.ndarray:
+        """Run one control tick through the policy's native action queue.
+
+        Unlike ``infer_chunk``, this calls ``policy.select_action`` on the
+        server.  The policy therefore receives every 50 Hz proprioceptive
+        sample while retaining its own checkpoint-defined action chunking.
+        """
+
+        rgb = np.asarray(front_rgb)
+        state = np.asarray(observation_state, dtype=np.float32).reshape(-1)
+        task_name = None if task is None else str(task).strip()
+        payload = {
+            "observation": {
+                "images": {
+                    "front": {
+                        "shape": list(rgb.shape),
+                        "dtype": str(rgb.dtype),
+                        "data_b64": base64.b64encode(rgb.tobytes()).decode("ascii"),
+                    }
+                },
+                "state": state.tolist(),
+            },
+            "robot_type": robot_type,
+            "return_chunk": False,
+        }
+        if observation_components:
+            payload["observation"]["state_components"] = {
+                str(key): np.asarray(value, dtype=np.float32).reshape(-1).tolist()
+                for key, value in observation_components.items()
+            }
+        if task_name:
+            payload["task"] = task_name
+        response = self._post_json("/infer", payload)
+        if "action" not in response:
+            raise RuntimeError("Expected action in single-action server response")
+        action = np.asarray(response["action"], dtype=np.float32).reshape(-1)
+        self._append_trace(
+            {
+                "event": "infer_single",
+                "timestamp": time.time(),
+                "step_idx": self._trace_step_idx,
+                "robot_type": robot_type,
+                "task": task_name,
+                "front_rgb_shape": list(rgb.shape),
+                "observation_state": state.tolist(),
+                "action": action.tolist(),
+            }
+        )
+        self._trace_step_idx += 1
+        return action
 
     def infer(
         self,

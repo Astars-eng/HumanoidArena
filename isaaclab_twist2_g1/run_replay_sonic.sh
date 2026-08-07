@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+export PYTHONPATH=/home/user/Documents/HumanoidArena/external/IsaacLab/source:$PYTHONPATHset -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/script/common/runtime_paths.sh"
@@ -9,7 +9,7 @@ cd "${SCRIPT_DIR}" || exit 1
 # User config: edit here
 # ------------------------------------------------------------------
 PYTHON_BIN="${PYTHON_BIN:-${ISAACLAB_PYTHON}}"
-REPLAY_FILE="${REPLAY_FILE:-}"
+REPLAY_FILE="${REPLAY_FILE:-/home/user/Documents/HumanoidArena/data/sonic/Isaac-Move-PickPlace-DoubleDesk-G129-Dex3-Wholebody_sonic_1776268633456387.npz}"
 REPLAY_MODE="${REPLAY_MODE:-direct_replay}"   # inference_replay | direct_replay
 REPLAY_LOOP="${REPLAY_LOOP:-0}"               # 1 | 0
 TASK_NAME="${TASK_NAME:-}"       # 留空则从 replay 文件读取

@@ -25,9 +25,6 @@ import torch
 _SERVER_STOP_REASON = "unknown"
 _LEGACY_CHECKPOINT_ROOT = Path("/mnt/workspace/users/xujunzhe/yunhengwang/lerobot/lerobot/checkpoints")
 _COMPAT_CHECKPOINT_ROOT = Path("/ai/Yichi/taowen/ckpts/checkpoints")
-_KNOWN_HF_CHECKPOINT_REFS = {
-    "paligemma-3b-pt-224": "google/paligemma-3b-pt-224",
-}
 
 TASK_LANGUAGE_INSTRUCTIONS = {
     "HOI_double_desk": "Put the hammer from the right table into the basket on the left table.",
@@ -69,56 +66,6 @@ _TASK_NAME_ALIASES = (
 )
 
 _HTTP_INFERENCE_IMAGE_TRANSFORM_TYPES = {"Resize", "Pad"}
-_HTTP_ROBOT_STATE_COMPONENT_KEYS = {
-    "observation.joint_pos",
-    "observation.joint_vel",
-    "observation.ang_vel_b",
-    "observation.gravity",
-}
-
-
-def _find_cached_hf_snapshot(repo_id: str) -> Path | None:
-    """Resolve a Hugging Face repo to a complete local snapshot, if cached."""
-
-    cache_roots = []
-    if os.environ.get("HF_HUB_CACHE"):
-        cache_roots.append(Path(os.environ["HF_HUB_CACHE"]).expanduser())
-    if os.environ.get("HF_HOME"):
-        cache_roots.append(Path(os.environ["HF_HOME"]).expanduser() / "hub")
-    if os.environ.get("XDG_CACHE_HOME"):
-        cache_roots.append(Path(os.environ["XDG_CACHE_HOME"]).expanduser() / "huggingface" / "hub")
-    cache_roots.append(Path.home() / ".cache" / "huggingface" / "hub")
-
-    model_dir_name = "models--" + repo_id.replace("/", "--")
-    seen = set()
-    for cache_root in cache_roots:
-        cache_root = cache_root.resolve()
-        if cache_root in seen:
-            continue
-        seen.add(cache_root)
-        model_dir = cache_root / model_dir_name
-        snapshots_dir = model_dir / "snapshots"
-        if not snapshots_dir.is_dir():
-            continue
-
-        candidates = []
-        main_ref = model_dir / "refs" / "main"
-        try:
-            revision = main_ref.read_text(encoding="utf-8").strip()
-        except OSError:
-            revision = ""
-        if revision:
-            candidates.append(snapshots_dir / revision)
-        candidates.extend(sorted(snapshots_dir.iterdir(), reverse=True))
-        for candidate in candidates:
-            tokenizer_files = ("tokenizer.json", "tokenizer.model", "spiece.model")
-            if (
-                candidate.is_dir()
-                and (candidate / "tokenizer_config.json").is_file()
-                and any((candidate / name).is_file() for name in tokenizer_files)
-            ):
-                return candidate.resolve()
-    return None
 
 
 def _remap_legacy_checkpoint_ref(value):
@@ -134,38 +81,6 @@ def _remap_legacy_checkpoint_ref(value):
         return value, False
     if path.exists():
         return value, False
-
-    # [interface conversion] Resolve checkpoint-internal absolute paths from a
-    # user-supplied map without editing the checkpoint itself.
-    try:
-        configured_remap = json.loads(os.environ.get("LEROBOT_VLA_CHECKPOINT_REF_REMAP", "{}"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("LEROBOT_VLA_CHECKPOINT_REF_REMAP must be a JSON object") from exc
-    mapped_value = configured_remap.get(value) if isinstance(configured_remap, dict) else None
-    if mapped_value:
-        mapped_path = Path(str(mapped_value)).expanduser().resolve()
-        if not mapped_path.exists():
-            raise FileNotFoundError(
-                f"Configured checkpoint ref target does not exist: {value} -> {mapped_path}"
-            )
-        print(
-            f"[lerobot_vla_server] remap configured checkpoint ref {value} -> {mapped_path}",
-            flush=True,
-        )
-        return str(mapped_path), True
-
-    # Checkpoints exported on another machine may retain an absolute path to
-    # the standard PaliGemma tokenizer. Prefer a complete local HF snapshot so
-    # startup remains offline and does not depend on the original filesystem.
-    repo_id = _KNOWN_HF_CHECKPOINT_REFS.get(path.name)
-    if repo_id is not None:
-        cached_snapshot = _find_cached_hf_snapshot(repo_id)
-        replacement = str(cached_snapshot) if cached_snapshot is not None else repo_id
-        print(
-            f"[lerobot_vla_server] remap portable checkpoint ref {value} -> {replacement}",
-            flush=True,
-        )
-        return replacement, True
 
     try:
         path.relative_to(_LEGACY_CHECKPOINT_ROOT)
@@ -450,7 +365,7 @@ def _load_policy(policy_dir: Path, device_name: str):
     lerobot_src = (
         Path(lerobot_src_override).expanduser().resolve()
         if lerobot_src_override
-        else Path(__file__).resolve().parents[1] / "src"
+        else Path(__file__).resolve().parents[4] / "lerobot" / "src"
     )
     if not lerobot_src.is_dir():
         raise FileNotFoundError(f"LeRobot src directory not found: {lerobot_src}")
@@ -469,8 +384,6 @@ def _load_policy(policy_dir: Path, device_name: str):
     try:
         from lerobot.utils.control_utils import predict_action
     except ModuleNotFoundError:
-        # [interface conversion] Custom/newer LeRobot forks moved this helper
-        # under lerobot.common while keeping the same call contract.
         from lerobot.common.control_utils import predict_action
 
     compat_dir_ctx, effective_policy_dir = _prepare_compat_policy_dir(policy_dir)
@@ -483,6 +396,7 @@ def _load_policy(policy_dir: Path, device_name: str):
     preprocessor = PolicyProcessorPipeline.from_pretrained(
         effective_policy_dir,
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+        overrides={"device_processor": {"device": device_name}},
     )
     postprocessor = PolicyProcessorPipeline.from_pretrained(
         effective_policy_dir,
@@ -503,14 +417,7 @@ def _load_policy(policy_dir: Path, device_name: str):
 
 
 class LeRobotServerState:
-    def __init__(
-        self,
-        policy_dir: Path,
-        device_name: str,
-        *,
-        verbatim_task: bool = False,
-        stretch_image_to_policy_shape: bool = False,
-    ):
+    def __init__(self, policy_dir: Path, device_name: str):
         (
             self.config,
             self.policy,
@@ -521,16 +428,9 @@ class LeRobotServerState:
             self._compat_policy_dir_ctx,
         ) = _load_policy(policy_dir, device_name)
         self.expected_state_shape = _feature_shape_dim(self.config.input_features.get("observation.state"))
+        self.expected_history_steps = int(getattr(self.config, "n_obs_steps", 1) or 1)
         self.expected_action_shape = _feature_shape_dim(self.config.output_features.get("action"))
-        self.expected_front_image_shape = _feature_shape_dim(
-            self.config.input_features.get("observation.images.front")
-        )
-        self.stretch_image_to_policy_shape = bool(stretch_image_to_policy_shape)
         self.http_image_transform = _load_server_image_transform(policy_dir)
-        # [interface conversion] Raw HumanoidArena checkpoints were trained on
-        # the literal dataset task string.  Keep an explicit mode that prevents
-        # the generic serving layer from replacing it with an English alias.
-        self.verbatim_task = bool(verbatim_task)
         self.default_task_name, self.default_task_instruction = _infer_task_instruction_from_policy_path(policy_dir)
         if self.default_task_instruction:
             print(
@@ -560,33 +460,6 @@ class LeRobotServerState:
         self.infer_count = 0
         self.current_seed: int | None = None
         self.reset()
-
-    def align_front_image(self, image: np.ndarray) -> np.ndarray:
-        """[interface conversion] Reproduce the converter's image geometry."""
-
-        if not self.stretch_image_to_policy_shape:
-            return image
-        shape = self.expected_front_image_shape
-        if shape is None or len(shape) != 3 or shape[0] not in (1, 3, 4):
-            raise ValueError(
-                "--stretch-image-to-policy-shape requires a CHW front-image feature, "
-                f"got {shape}"
-            )
-        target_h, target_w = int(shape[1]), int(shape[2])
-        if image.shape[:2] == (target_h, target_w):
-            return np.ascontiguousarray(image)
-        # The training converter used cv2.INTER_AREA for downsampling and
-        # cv2.INTER_LINEAR for enlargement, without aspect-ratio padding.
-        import cv2
-
-        interpolation = (
-            cv2.INTER_AREA
-            if image.shape[0] >= target_h and image.shape[1] >= target_w
-            else cv2.INTER_LINEAR
-        )
-        return np.ascontiguousarray(
-            cv2.resize(image, (target_w, target_h), interpolation=interpolation)
-        )
 
     def _seed_runtime(self, seed: int) -> None:
         normalized_seed = int(seed) & 0xFFFFFFFF
@@ -696,13 +569,14 @@ class LeRobotServerState:
     def _log_raw_state(self, state_tensor: torch.Tensor) -> None:
         if not self._should_log_action_debug():
             return
-        arr = state_tensor.detach().cpu().to(torch.float32).reshape(-1)
+        state_cpu = state_tensor.detach().cpu().to(torch.float32)
+        arr = state_cpu[..., -1, :].reshape(-1) if state_cpu.ndim == 3 else state_cpu.reshape(-1)
         stats = self._get_state_stats()
         print(
             f"[lerobot_vla_server][state_debug] infer={self.infer_count + 1} "
             f"raw_state shape={tuple(state_tensor.shape)} mean={arr.mean().item():+.4f} "
             f"std={arr.std(unbiased=False).item():.4f} min={arr.min().item():+.4f} max={arr.max().item():+.4f} "
-            f"first={arr.tolist()}",
+            f"latest={arr.tolist()}",
             flush=True,
         )
         q01 = stats.get("q01")
@@ -750,7 +624,8 @@ class LeRobotServerState:
         state = processed_observation.get("observation.state")
         if state is None:
             return
-        arr = state.detach().cpu().to(torch.float32).reshape(-1)
+        state_cpu = state.detach().cpu().to(torch.float32)
+        arr = state_cpu[..., -1, :].reshape(-1) if state_cpu.ndim == 3 else state_cpu.reshape(-1)
         bins = np.digitize(arr.numpy(), bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
         over = arr.abs() > 1.0
         print(
@@ -758,7 +633,7 @@ class LeRobotServerState:
             f"normalized_state shape={tuple(state.shape)} mean={arr.mean().item():+.4f} "
             f"std={arr.std(unbiased=False).item():.4f} min={arr.min().item():+.4f} max={arr.max().item():+.4f} "
             f"outside_unit={over.float().mean().item() * 100:.1f}% bin_min={int(bins.min())} bin_max={int(bins.max())} "
-            f"first={arr.tolist()}",
+            f"latest={arr.tolist()}",
             flush=True,
         )
         if bool(over.any().item()):
@@ -834,11 +709,6 @@ class LeRobotServerState:
             )
 
     def resolve_task_instruction(self, task_value: str | None) -> tuple[str | None, str | None]:
-        if self.verbatim_task:
-            task = None if task_value is None else str(task_value).strip()
-            if not task:
-                raise ValueError("--verbatim-task requires a non-empty task in each inference request")
-            return task, task
         task_name, instruction = _resolve_task_instruction(task_value)
         if instruction:
             return task_name, instruction
@@ -921,14 +791,18 @@ def make_handler(state: LeRobotServerState):
                 payload = self._read_json()
                 image = _decode_image(payload["observation"]["images"]["front"])
                 raw_image_shape = tuple(image.shape)
-                image = state.align_front_image(image)
                 if state.http_image_transform is not None:
                     image = state.http_image_transform(image)
                 observation_state = np.asarray(payload["observation"]["state"], dtype=np.float32).copy()
-                if state.expected_state_shape is not None and observation_state.shape != state.expected_state_shape:
-                    raise ValueError(
-                        f"Expected observation.state shape {state.expected_state_shape}, got {observation_state.shape}"
-                    )
+                if state.expected_state_shape is not None:
+                    valid_shapes = {tuple(state.expected_state_shape)}
+                    if state.expected_history_steps > 1:
+                        valid_shapes.add((state.expected_history_steps, *tuple(state.expected_state_shape)))
+                    if observation_state.shape not in valid_shapes:
+                        raise ValueError(
+                            f"Expected observation.state shape in {sorted(valid_shapes)}, "
+                            f"got {observation_state.shape}"
+                        )
                 robot_type = payload.get("robot_type", "g129")
                 task_value = payload.get("task", payload.get("task_name"))
                 task_name, task_instruction = state.resolve_task_instruction(task_value)
@@ -936,28 +810,6 @@ def make_handler(state: LeRobotServerState):
                     "observation.images.front": image,
                     "observation.state": observation_state,
                 }
-                # [interface conversion] Rehydrate only the robot proprioception
-                # fields used by split-feature checkpoints.  Arbitrary fields
-                # (including task/environment state) are rejected so this HTTP
-                # bridge cannot become a task-logic side channel.
-                state_components = payload["observation"].get("state_components") or {}
-                unexpected_components = sorted(
-                    set(state_components) - _HTTP_ROBOT_STATE_COMPONENT_KEYS
-                )
-                if unexpected_components:
-                    raise ValueError(
-                        f"Unsupported observation state components: {unexpected_components}"
-                    )
-                for key, value in state_components.items():
-                    component = np.asarray(value, dtype=np.float32).copy()
-                    expected_shape = _feature_shape_dim(state.config.input_features.get(key))
-                    if expected_shape is not None and component.shape != expected_shape:
-                        raise ValueError(
-                            f"Expected {key} shape {expected_shape}, got {component.shape}"
-                        )
-                    if not np.isfinite(component).all():
-                        raise ValueError(f"{key} contains NaN or Inf")
-                    observation[key] = component
                 infer_index = state.infer_count + 1
                 if infer_index == 1:
                     print(
@@ -1027,42 +879,7 @@ def main():
     parser.add_argument("--port", type=int, default=8443, help="Bind port")
     parser.add_argument("--tls-cert-file", default="", help="Optional TLS certificate file")
     parser.add_argument("--tls-key-file", default="", help="Optional TLS private key file")
-    parser.add_argument(
-        "--lerobot-src",
-        default=os.environ.get("LEROBOT_VLA_SRC", ""),
-        help="Optional LeRobot src directory matching the checkpoint implementation",
-    )
-    parser.add_argument(
-        "--checkpoint-ref-remap",
-        action="append",
-        default=[],
-        metavar="OLD=NEW",
-        help="Remap an unavailable absolute path embedded in checkpoint JSON (repeatable)",
-    )
-    parser.add_argument(
-        "--verbatim-task",
-        action="store_true",
-        help="Pass the request task string to the checkpoint exactly as received.",
-    )
-    parser.add_argument(
-        "--stretch-image-to-policy-shape",
-        action="store_true",
-        help="Resize the HTTP image directly to the checkpoint CHW shape without aspect padding.",
-    )
     args = parser.parse_args()
-
-    if args.lerobot_src:
-        os.environ["LEROBOT_VLA_SRC"] = str(Path(args.lerobot_src).expanduser().resolve())
-    configured_remap = {}
-    for item in args.checkpoint_ref_remap:
-        if "=" not in item:
-            parser.error(f"--checkpoint-ref-remap must use OLD=NEW, got {item!r}")
-        old, new = item.split("=", 1)
-        if not old or not new:
-            parser.error(f"--checkpoint-ref-remap must use non-empty OLD=NEW, got {item!r}")
-        configured_remap[old] = str(Path(new).expanduser().resolve())
-    if configured_remap:
-        os.environ["LEROBOT_VLA_CHECKPOINT_REF_REMAP"] = json.dumps(configured_remap)
 
     policy_dir = Path(args.policy_path).expanduser().resolve()
     if not policy_dir.is_dir():
@@ -1072,12 +889,7 @@ def main():
 
     server = None
     try:
-        state = LeRobotServerState(
-            policy_dir,
-            args.device,
-            verbatim_task=args.verbatim_task,
-            stretch_image_to_policy_shape=args.stretch_image_to_policy_shape,
-        )
+        state = LeRobotServerState(policy_dir, args.device)
         server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 
         if args.tls_cert_file and args.tls_key_file:

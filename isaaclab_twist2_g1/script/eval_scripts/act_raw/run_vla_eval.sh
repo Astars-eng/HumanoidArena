@@ -4,36 +4,51 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISAACLAB_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-LEROBOT_CONDA_ENV_NAME="${LEROBOT_CONDA_ENV_NAME:-lerobot}"
 source "${ISAACLAB_ROOT}/script/common/runtime_paths.sh"
 export ROBOT_USD_OVERRIDE="${ISAACLAB_ROOT}/assets/robots/g1-29dof_wholebody_dex3/g1_29dof_with_dex3_rev_1_0_m2.usd"
-ENV_CONFIG_YAML="${ENV_CONFIG_YAML:-tasks/common_env_config/doubledesk_sonic.yaml}"
-ISAAC_DEVICE="cpu"
-HEADLESS=1
-MAX_STEPS=1000
-VIDEO_FPS=30
-POST_TERMINATION_RECORD_STEPS=50
+ENV_CONFIG_YAML="${ENV_CONFIG_YAML:-tasks/common_test_config/base_test/doubledesk_sonic_test.yaml}"
+ISAAC_DEVICE="${ISAAC_DEVICE:-cpu}"
+HEADLESS="${HEADLESS:-1}"
+MAX_STEPS="${MAX_STEPS:-1000}"
+VIDEO_FPS="${VIDEO_FPS:-30}"
+POST_TERMINATION_RECORD_STEPS="${POST_TERMINATION_RECORD_STEPS:-50}"
 ROBOT_TYPE="unitree_g1_refpose_v3_1"
 SONIC_VLA_ROOT_ROT6D_LAYOUT="row"
 SONIC_VLA_ROOT_MAX_DELTA_DEG="26.0"
+SONIC_VLA_ACTION_FORMAT="${SONIC_VLA_ACTION_FORMAT:-raw107}"
+SONIC_RAW107_BODY_SOURCE="${SONIC_RAW107_BODY_SOURCE:-native_decoder}"
+SONIC_OUTPUT_DELAY_STEPS="${SONIC_OUTPUT_DELAY_STEPS:-0}"
+export SONIC_OUTPUT_DELAY_STEPS
 LEROBOT_VLA_RECORD_OUTPUTS="${LEROBOT_VLA_RECORD_OUTPUTS:-1}"
 
 SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onnx}"
 SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
 
-SERVER_PYTHON="${SERVER_PYTHON:-python}"
+DEFAULT_SERVER_PYTHON="python"
+if [[ -x "/home/user/anaconda3/envs/lerobot/bin/python" ]]; then
+  DEFAULT_SERVER_PYTHON="/home/user/anaconda3/envs/lerobot/bin/python"
+fi
+SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
 SERVER_SCRIPT="${ISAACLAB_ROOT}/../lerobot/scripts/serve_lerobot_vla_http.py"
 SERVER_DEVICE="cuda:0"
+SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-${LEROBOT_VLA_SRC:-}}"
+if [[ -z "${SERVER_LEROBOT_SRC}" && -d "${ISAACLAB_ROOT}/../../fym/vla/src" ]]; then
+  SERVER_LEROBOT_SRC="$(cd "${ISAACLAB_ROOT}/../../fym/vla/src" && pwd)"
+fi
+SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-}"
+SERVER_VERBATIM_TASK="${SERVER_VERBATIM_TASK:-1}"
+SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE="${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE:-1}"
 SERVER_HOST="127.0.0.1"
 SERVER_PORT=8443
 SERVER_SCHEME="http"
-SERVER_READY_TIMEOUT=1800
-LEROBOT_SERVER_TIMEOUT=360.0
+SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
+LEROBOT_SERVER_TIMEOUT=5.0
 LEROBOT_VERIFY_SSL=0
 TLS_CERT_FILE=""
 TLS_KEY_FILE=""
 
 REPEATS_PER_SEED="${REPEATS_PER_SEED:-1}"
+PERSISTENT_SIM="${PERSISTENT_SIM:-0}"
 if [[ -n "${EVAL_SEEDS:-}" ]]; then
   read -r -a SEEDS <<< "${EVAL_SEEDS}"
 else
@@ -80,12 +95,15 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
 fi
 MODEL_PATHS=("${MODEL_PATH}")
 
+"${SERVER_PYTHON}" "${SCRIPT_DIR}/raw107_contract.py" "${MODEL_PATH}"
+
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/eval_results/single_$(date +%Y%m%d_%H%M%S)}"
 
 ARGS=(
   --task "${TASK_NAME}"
   --env_config_yaml "${ENV_CONFIG_YAML}"
   --repeats_per_seed "${REPEATS_PER_SEED}"
+  --persistent_sim "${PERSISTENT_SIM}"
   --max_steps "${MAX_STEPS}"
   --video_fps "${VIDEO_FPS}"
   --post_termination_record_steps "${POST_TERMINATION_RECORD_STEPS}"
@@ -94,6 +112,8 @@ ARGS=(
   --sonic_decoder_path "${SONIC_DECODER_PATH}"
   --sonic_vla_root_rot6d_layout "${SONIC_VLA_ROOT_ROT6D_LAYOUT}"
   --sonic_vla_root_max_delta_deg "${SONIC_VLA_ROOT_MAX_DELTA_DEG}"
+  --sonic_vla_action_format "${SONIC_VLA_ACTION_FORMAT}"
+  --sonic_raw107_body_source "${SONIC_RAW107_BODY_SOURCE}"
   --results_dir "${RESULTS_DIR}"
   --isaac_device "${ISAAC_DEVICE}"
   --server_python "${SERVER_PYTHON}"
@@ -105,6 +125,19 @@ ARGS=(
   --server_ready_timeout "${SERVER_READY_TIMEOUT}"
   --lerobot_server_timeout "${LEROBOT_SERVER_TIMEOUT}"
 )
+
+if [[ -n "${SERVER_LEROBOT_SRC}" ]]; then
+  ARGS+=(--server_lerobot_src "${SERVER_LEROBOT_SRC}")
+fi
+if [[ -n "${SERVER_CHECKPOINT_REF_REMAP}" ]]; then
+  ARGS+=(--server_checkpoint_ref_remap "${SERVER_CHECKPOINT_REF_REMAP}")
+fi
+if [[ "${SERVER_VERBATIM_TASK}" == "1" ]]; then
+  ARGS+=(--server_verbatim_task)
+fi
+if [[ "${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE}" == "1" ]]; then
+  ARGS+=(--server_stretch_image_to_policy_shape)
+fi
 
 if [[ "${HEADLESS}" == "1" ]]; then
   ARGS+=(--headless)

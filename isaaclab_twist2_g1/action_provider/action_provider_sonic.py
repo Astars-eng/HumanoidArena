@@ -61,6 +61,12 @@ from action_provider.reset_control import (
     get_input_ready_key,
     publish_reset_command,
 )
+from action_provider.sonic_raw_policy_adapter import (
+    SONIC_RAW_POLICY_ACTION_DIM,
+    build_sonic_raw_policy_observation,
+    sonic_raw_body_to_joint_targets,
+    split_sonic_raw_policy_action,
+)
 from action_provider.vla_robot_current_local_runtime_v3 import (
     VLA_ROBOT_CURRENT_LOCAL_V3_ACTION_DIM,
     VLA_ROBOT_CURRENT_LOCAL_V3_STATE_DIM,
@@ -1494,7 +1500,15 @@ class SonicActionProvider(ActionProvider):
         self._enable_rtf_monitor = getattr(args_cli, "enable_rtf_monitor", False)
         self._use_effort_control = bool(getattr(args_cli, "sonic_effort_control", False))
 
-        self.enable_dex3    = getattr(args_cli, "enable_dex3_dds",   False)
+        # Dex3 joint control and Dex3 DDS input are separate concerns.  Most
+        # legacy launchers used one flag for both, but policy evaluation may
+        # need the physical hand joints while forbidding external DDS commands
+        # from overriding the policy's predicted hand targets.
+        self._enable_dex3_dds_input = bool(getattr(args_cli, "enable_dex3_dds", False))
+        self._enable_dex3_model_control = bool(
+            getattr(args_cli, "enable_dex3_model_control", False)
+        )
+        self.enable_dex3 = self._enable_dex3_dds_input or self._enable_dex3_model_control
         self.enable_gripper = getattr(args_cli, "enable_dex1_dds",   False)
         self.enable_robot   = getattr(args_cli, "robot_type", "g129")
         self._pose_source   = getattr(args_cli, "sonic_pose_source", "redis")  # "zmq" | "redis"
@@ -1522,12 +1536,32 @@ class SonicActionProvider(ActionProvider):
             self._vla_action_format = "semantic_v3"
         elif self._vla_action_format in {"latent", "latent64", "sonic_latent64", "decoder_latent64"}:
             self._vla_action_format = "latent64"
+        elif self._vla_action_format in {"raw", "raw107", "sonic_raw107", "decoder_raw107"}:
+            self._vla_action_format = "raw107"
         else:
             raise ValueError(
                 f"[SonicActionProvider] Unsupported SONIC_VLA_ACTION_FORMAT={self._vla_action_format!r}; "
-                "expected semantic_v3 or latent64"
+                "expected semantic_v3, latent64, or raw107"
             )
         self._use_vla_latent64 = self._use_lerobot_vla and self._vla_action_format == "latent64"
+        self._use_vla_raw107 = self._use_lerobot_vla and self._vla_action_format == "raw107"
+        self._raw107_body_source = str(
+            getattr(
+                args_cli,
+                "sonic_raw107_body_source",
+                os.environ.get("SONIC_RAW107_BODY_SOURCE", "native_decoder"),
+            )
+            or "native_decoder"
+        ).strip().lower()
+        if self._raw107_body_source not in {"native_decoder", "direct_raw"}:
+            raise ValueError(
+                f"[SonicActionProvider] Unsupported SONIC_RAW107_BODY_SOURCE={self._raw107_body_source!r}; "
+                "expected native_decoder or direct_raw"
+            )
+        # [interface conversion] The raw checkpoint was trained with LeRobot
+        # robot_type='g1'.  Keep the physical HumanoidArena robot identifier
+        # separate from the metadata supplied to the policy.
+        self._lerobot_robot_type = "g1" if self._use_vla_raw107 else self.enable_robot
         self._lerobot_server_url = getattr(args_cli, "lerobot_server_url", "") or ""
         self._lerobot_server_timeout = float(getattr(args_cli, "lerobot_server_timeout", 5.0))
         self._lerobot_server_verify_ssl = bool(getattr(args_cli, "lerobot_server_verify_ssl", False))
@@ -1743,7 +1777,20 @@ class SonicActionProvider(ActionProvider):
             self._setup_redis()
         else:
             self._setup_zmq()
-        self._setup_policy()
+        # [control stabilization] A raw107 checkpoint predicts both the
+        # open-loop decoder raw action and the encoder token.  The native GMT
+        # interface consumes the token through its proprioceptive SONIC
+        # decoder.  Keep direct_raw as an explicit audit path.
+        if self._use_vla_raw107 and self._raw107_body_source == "native_decoder":
+            self._encoder = None
+            self._decoder = self._make_session(self.decoder_path)
+            print("[SonicActionProvider] raw107 body source=native_decoder (encoder_token -> SONIC decoder)")
+        elif not self._use_vla_raw107:
+            self._setup_policy()
+        else:
+            self._encoder = None
+            self._decoder = None
+            print("[SonicActionProvider] raw107 body source=direct_raw (audit mode)")
         self._setup_buffers()
         self._sonic_last_executed_target = self._sonic_default_np.copy()
         if self._sonic_output_delay_steps > 0:
@@ -2252,11 +2299,15 @@ class SonicActionProvider(ActionProvider):
                 f"[SonicActionProvider] VLA v3.1 policy must use observation.state shape {(SONIC_VLA_STATE_DIM,)}, "
                 f"got {state_shape}"
             )
-        expected_action_shapes = (
-            {(SONIC_VLA_LATENT64_ACTION_DIM,), (SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM,)}
-            if self._use_vla_latent64
-            else {(SONIC_VLA_ACTION_DIM,)}
-        )
+        if self._use_vla_raw107:
+            expected_action_shapes = {(SONIC_RAW_POLICY_ACTION_DIM,)}
+        elif self._use_vla_latent64:
+            expected_action_shapes = {
+                (SONIC_VLA_LATENT64_ACTION_DIM,),
+                (SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM,),
+            }
+        else:
+            expected_action_shapes = {(SONIC_VLA_ACTION_DIM,)}
         if action_shape and action_shape not in expected_action_shapes:
             expected = ", ".join(str(shape) for shape in sorted(expected_action_shapes))
             raise ValueError(
@@ -2344,16 +2395,50 @@ class SonicActionProvider(ActionProvider):
             )
         return state
 
+    def _build_lerobot_raw107_observation(
+        self,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """[interface conversion] Reproduce the raw checkpoint proprioception."""
+
+        robot = self.env.scene["robot"].data
+        # The source recorder wrote these arrays through self._sonic_idx.  Keep
+        # that actual numeric order even though legacy dataset metadata labels
+        # the observation fields with DFS-order names.
+        joint_pos = robot.joint_pos[0, self._sonic_idx].cpu().numpy().astype(np.float32)
+        joint_vel = robot.joint_vel[0, self._sonic_idx].cpu().numpy().astype(np.float32)
+        ang_vel_b = robot.root_ang_vel_b[0].cpu().numpy().astype(np.float32)
+        base_quat_wxyz, _ = self._get_current_robot_root_pose_for_vla()
+        gravity = gravity_dir_from_base_quat_wxyz(base_quat_wxyz)
+        return build_sonic_raw_policy_observation(
+            joint_pos=joint_pos,
+            joint_vel=joint_vel,
+            ang_vel_b=ang_vel_b,
+            gravity=gravity,
+        )
+
     def _fetch_lerobot_action_chunk(self) -> np.ndarray:
         rgb = self._get_front_camera_rgb_for_vla()
-        state = self._build_lerobot_vla_observation_state()
+        if self._use_vla_raw107:
+            state, state_components = self._build_lerobot_raw107_observation()
+        else:
+            state = self._build_lerobot_vla_observation_state()
+            state_components = None
         if self._lerobot_http_client is not None:
-            action_chunk = self._lerobot_http_client.infer_chunk(
-                front_rgb=rgb,
-                observation_state=state,
-                robot_type=self.enable_robot,
-                task=self.task_name,
-            )
+            if self._use_vla_raw107:
+                action_chunk = self._lerobot_http_client.infer_single(
+                    front_rgb=rgb,
+                    observation_state=state,
+                    observation_components=state_components,
+                    robot_type=self._lerobot_robot_type,
+                    task=self.task_name,
+                ).reshape(1, -1)
+            else:
+                action_chunk = self._lerobot_http_client.infer_chunk(
+                    front_rgb=rgb,
+                    observation_state=state,
+                    robot_type=self._lerobot_robot_type,
+                    task=self.task_name,
+                )
         else:
             if self._lerobot_policy is None or self._lerobot_predict_action is None:
                 raise RuntimeError("[SonicActionProvider] LeRobot VLA requested before initialization")
@@ -2361,6 +2446,8 @@ class SonicActionProvider(ActionProvider):
                 "observation.images.front": rgb,
                 "observation.state": state,
             }
+            if state_components:
+                observation.update(state_components)
             action = self._lerobot_predict_action(
                 observation=observation,
                 policy=self._lerobot_policy,
@@ -2369,7 +2456,7 @@ class SonicActionProvider(ActionProvider):
                 postprocessor=self._lerobot_postprocessor,
                 use_amp=self._lerobot_device.type == "cuda",
                 task=self.task_name,
-                robot_type=self.enable_robot,
+                robot_type=self._lerobot_robot_type,
             )
             if isinstance(action, torch.Tensor):
                 action_chunk = action.detach().cpu().numpy().astype(np.float32)
@@ -2379,11 +2466,15 @@ class SonicActionProvider(ActionProvider):
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         if action_chunk.ndim == 1:
             action_chunk = action_chunk.reshape(1, -1)
-        expected_dims = (
-            {SONIC_VLA_LATENT64_ACTION_DIM, SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM}
-            if self._use_vla_latent64
-            else {SONIC_VLA_ACTION_DIM}
-        )
+        if self._use_vla_raw107:
+            expected_dims = {SONIC_RAW_POLICY_ACTION_DIM}
+        elif self._use_vla_latent64:
+            expected_dims = {
+                SONIC_VLA_LATENT64_ACTION_DIM,
+                SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM,
+            }
+        else:
+            expected_dims = {SONIC_VLA_ACTION_DIM}
         if action_chunk.ndim != 2 or action_chunk.shape[1] not in expected_dims:
             expected = "/".join(str(dim) for dim in sorted(expected_dims))
             raise ValueError(
@@ -2419,8 +2510,21 @@ class SonicActionProvider(ActionProvider):
             f"{SONIC_VLA_LATENT64_ACTION_DIM} or {SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM}, got {action.shape}"
         )
 
+    def _pop_lerobot_raw107_action(self) -> np.ndarray:
+        action = self._pop_lerobot_action()
+        if action.shape != (SONIC_RAW_POLICY_ACTION_DIM,):
+            raise ValueError(
+                f"[SonicActionProvider] Expected raw107 VLA action dim "
+                f"{SONIC_RAW_POLICY_ACTION_DIM}, got {action.shape}"
+            )
+        return action
+
     def _should_refresh_lerobot_visuals_next_step(self) -> bool:
-        return (not self._use_lerobot_vla) or (len(self._lerobot_action_chunk_queue) == 0)
+        return (
+            (not self._use_lerobot_vla)
+            or self._use_vla_raw107
+            or (len(self._lerobot_action_chunk_queue) == 0)
+        )
 
     def _infer_lerobot_semantic_action(self) -> np.ndarray:
         return self._pop_lerobot_semantic_action()
@@ -2608,7 +2712,37 @@ class SonicActionProvider(ActionProvider):
             )
         return self._decode_sonic_latent64_live(latent64)
 
+    def _run_gear_sonic_raw107_from_vla(self) -> np.ndarray:
+        """Execute a raw107 checkpoint through the selected SONIC body interface."""
+
+        action = self._pop_lerobot_raw107_action()
+        split = split_sonic_raw_policy_action(action)
+        self._latest_vla_action = action.copy()
+        self._latent = split.encoder_token.reshape(1, -1).copy()
+        self._left_hand_target[:] = split.left_hand
+        self._right_hand_target[:] = split.right_hand
+
+        if self._raw107_body_source == "native_decoder":
+            # [control stabilization] Decode the policy's predicted SONIC
+            # encoder token with live robot-only proprioception.  This is the
+            # checkpoint-independent GMT stabilizer used during data capture;
+            # it reads no task/object state and performs no task planning.
+            return self._decode_sonic_latent64_live(split.encoder_token)
+
+        # [interface conversion] Audit path: execute the checkpoint's predicted
+        # open-loop decoder raw action without clipping or smoothing.
+        target_sonic = sonic_raw_body_to_joint_targets(
+            split.body_raw,
+            action_scale=G1_ACTION_SCALE_ISAACLAB,
+            default_joint_pos=self._sonic_default_np,
+        )
+        self._latest_decoder_raw_action = split.body_raw.copy()
+        self._latest_decoder_target = target_sonic.copy()
+        return target_sonic
+
     def _run_gear_sonic_from_vla(self) -> np.ndarray:
+        if self._use_vla_raw107:
+            return self._run_gear_sonic_raw107_from_vla()
         if self._use_vla_latent64:
             return self._run_gear_sonic_latent64_from_vla()
         action = self._infer_lerobot_semantic_action()
@@ -4096,10 +4230,13 @@ class SonicActionProvider(ActionProvider):
 
     def _setup_hand_dds(self, args_cli):
         self._dex3_dds = None
+        if not self._enable_dex3_dds_input:
+            if self._enable_dex3_model_control:
+                print("[SonicActionProvider] Dex3 hand source=model prediction (DDS input disabled)")
+            return
         try:
             from dds.dds_master import dds_manager
-            if self.enable_dex3:
-                self._dex3_dds = dds_manager.get_object("dex3")
+            self._dex3_dds = dds_manager.get_object("dex3")
         except Exception as e:
             print(f"[SonicActionProvider] hand DDS init skipped: {e}")
 
@@ -5661,7 +5798,7 @@ class SonicActionProvider(ActionProvider):
 
 
     def _apply_hand_targets(self, full_action: torch.Tensor):
-        if self._dex3_dds is not None:
+        if self._enable_dex3_dds_input and self._dex3_dds is not None:
             try:
                 cmds = self._dex3_dds.get_hand_commands()
                 if cmds:
@@ -5680,7 +5817,8 @@ class SonicActionProvider(ActionProvider):
                     return
             except Exception:
                 pass
-        # fallback: ZMQ 手部数据
+        # Provider-owned hand targets.  For raw107 VLA these are the model's
+        # continuous action[93:100] and action[100:107] predictions.
         if hasattr(self, "_left_hand_idx") and self._left_hand_idx.numel() > 0:
             full_action.index_copy_(
                 0, self._left_hand_idx,

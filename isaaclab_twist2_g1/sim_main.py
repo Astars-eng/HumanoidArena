@@ -117,6 +117,20 @@ parser.add_argument("--lerobot_policy_device", type=str, default="",
                     help="Inference device for LeRobot policy. Defaults to --device when empty.")
 parser.add_argument("--lerobot_gripper_threshold", type=float, default=0.5,
                     help="Threshold for binarizing LeRobot grip outputs in vla mode")
+parser.add_argument(
+    "--sonic_vla_action_format",
+    type=str,
+    default=os.environ.get("SONIC_VLA_ACTION_FORMAT", "semantic_v3"),
+    choices=["semantic_v3", "latent64", "raw107"],
+    help="SONIC VLA output contract; raw107 is raw29 + encoder64 + left/right hand7",
+)
+parser.add_argument(
+    "--sonic_raw107_body_source",
+    type=str,
+    default=os.environ.get("SONIC_RAW107_BODY_SOURCE", "native_decoder"),
+    choices=["native_decoder", "direct_raw"],
+    help="raw107 body interface: close the loop through the native SONIC decoder or audit direct raw29",
+)
 parser.add_argument("--lerobot_server_url", type=str, default="",
                     help="HTTP(S) endpoint for remote LeRobot VLA inference")
 parser.add_argument("--lerobot_server_timeout", type=float, default=5.0,
@@ -860,7 +874,15 @@ def main():
             raise ValueError("--lerobot_server_url or --lerobot_policy_path is required when using input_source=vla")
         if float(args_cli.human_height) <= 0.0:
             raise ValueError("--human_height must be positive when using input_source=vla")
-        print("VLA runtime schema: unitree_g1_gmt_refpose_v3_1, observation.state=64D, action=40D ref-pose local output")
+        if args_cli.gmt_backend == "sonic" and args_cli.sonic_vla_action_format == "raw107":
+            print(
+                "VLA runtime schema: sonic_raw107, observation.state="
+                "[q29, qd29, ang_vel_b3, gravity3], action="
+                "[decoder_raw29, encoder64, left_hand7, right_hand7], body_source="
+                f"{args_cli.sonic_raw107_body_source}"
+            )
+        else:
+            print("VLA runtime schema: unitree_g1_gmt_refpose_v3_1, observation.state=64D, action=40D ref-pose local output")
     print("=" * 60)
 
     # parse environment configuration

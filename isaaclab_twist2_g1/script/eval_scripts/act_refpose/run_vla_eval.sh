@@ -4,36 +4,45 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISAACLAB_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-LEROBOT_CONDA_ENV_NAME="${LEROBOT_CONDA_ENV_NAME:-lerobot}"
 source "${ISAACLAB_ROOT}/script/common/runtime_paths.sh"
 export ROBOT_USD_OVERRIDE="${ISAACLAB_ROOT}/assets/robots/g1-29dof_wholebody_dex3/g1_29dof_with_dex3_rev_1_0_m2.usd"
 ENV_CONFIG_YAML="${ENV_CONFIG_YAML:-tasks/common_env_config/doubledesk_sonic.yaml}"
-ISAAC_DEVICE="cpu"
-HEADLESS=1
-MAX_STEPS=1000
-VIDEO_FPS=30
-POST_TERMINATION_RECORD_STEPS=50
+ISAAC_DEVICE="${ISAAC_DEVICE:-cpu}"
+HEADLESS="${HEADLESS:-1}"
+MAX_STEPS="${MAX_STEPS:-1000}"
+VIDEO_FPS="${VIDEO_FPS:-30}"
+POST_TERMINATION_RECORD_STEPS="${POST_TERMINATION_RECORD_STEPS:-50}"
 ROBOT_TYPE="unitree_g1_refpose_v3_1"
 SONIC_VLA_ROOT_ROT6D_LAYOUT="row"
 SONIC_VLA_ROOT_MAX_DELTA_DEG="26.0"
 LEROBOT_VLA_RECORD_OUTPUTS="${LEROBOT_VLA_RECORD_OUTPUTS:-1}"
+ACT_REFPOSE_HISTORY_STEPS="${ACT_REFPOSE_HISTORY_STEPS:-10}"
+ACT_REFPOSE_EXECUTE_STEPS="${ACT_REFPOSE_EXECUTE_STEPS:-5}"
+ACT_REFPOSE_RECORD_FULL_CHUNKS="${ACT_REFPOSE_RECORD_FULL_CHUNKS:-1}"
 
 SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onnx}"
 SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
 
-SERVER_PYTHON="${SERVER_PYTHON:-python}"
-SERVER_SCRIPT="${ISAACLAB_ROOT}/../lerobot/scripts/serve_lerobot_vla_http.py"
+DEFAULT_SERVER_PYTHON="python"
+if [[ -x "/home/user/anaconda3/envs/lerobot/bin/python" ]]; then
+  DEFAULT_SERVER_PYTHON="/home/user/anaconda3/envs/lerobot/bin/python"
+fi
+SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
+SERVER_SCRIPT="${SCRIPT_DIR}/serve_act_refpose_vla_http.py"
 SERVER_DEVICE="cuda:0"
 SERVER_HOST="127.0.0.1"
 SERVER_PORT=8443
 SERVER_SCHEME="http"
-SERVER_READY_TIMEOUT=1800
-LEROBOT_SERVER_TIMEOUT=360.0
+SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
+LEROBOT_SERVER_TIMEOUT=5.0
 LEROBOT_VERIFY_SSL=0
 TLS_CERT_FILE=""
 TLS_KEY_FILE=""
 
 REPEATS_PER_SEED="${REPEATS_PER_SEED:-1}"
+if [[ -z "${LEROBOT_VLA_SRC:-}" && -d "${ISAACLAB_ROOT}/../../fym/vla/src" ]]; then
+  export LEROBOT_VLA_SRC="$(cd "${ISAACLAB_ROOT}/../../fym/vla/src" && pwd)"
+fi
 if [[ -n "${EVAL_SEEDS:-}" ]]; then
   read -r -a SEEDS <<< "${EVAL_SEEDS}"
 else
@@ -89,6 +98,9 @@ ARGS=(
   --max_steps "${MAX_STEPS}"
   --video_fps "${VIDEO_FPS}"
   --post_termination_record_steps "${POST_TERMINATION_RECORD_STEPS}"
+  --act_refpose_history_steps "${ACT_REFPOSE_HISTORY_STEPS}"
+  --act_refpose_execute_steps "${ACT_REFPOSE_EXECUTE_STEPS}"
+  --act_refpose_record_full_chunks "${ACT_REFPOSE_RECORD_FULL_CHUNKS}"
   --robot_type "${ROBOT_TYPE}"
   --sonic_encoder_path "${SONIC_ENCODER_PATH}"
   --sonic_decoder_path "${SONIC_DECODER_PATH}"
@@ -131,7 +143,7 @@ for model_path in "${MODEL_PATHS[@]}"; do
 done
 
 cd "${SCRIPT_DIR}"
-  
+
 if [[ "${LEROBOT_VLA_RECORD_OUTPUTS}" == "1" ]]; then
   export LEROBOT_VLA_RECORD_OUTPUTS=1
 fi
