@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 ISAACLAB_ROOT = Path(__file__).resolve().parents[3]
@@ -59,13 +60,56 @@ def _episode_stem(model_label: str, seed: int, repeat_idx: int, episode_index: i
     return f"{model_label}__seed_{seed}__repeat_{repeat_idx}__episode_{episode_index}"
 
 
-def _wait_for_server_ready(base_url: str, timeout_s: float, verify_ssl: bool) -> None:
+def _wait_for_server_ready(
+    base_url: str,
+    timeout_s: float,
+    verify_ssl: bool,
+    *,
+    expected_model_path: str,
+    server_process=None,
+) -> None:
     client = LeRobotVLAHttpClient(base_url=base_url, timeout_s=2.0, verify_ssl=verify_ssl)
+    expected_path = str(Path(expected_model_path).expanduser().resolve())
+    expected_instance_token = str(getattr(server_process, "act_refpose_instance_token", "") or "")
     deadline = time.time() + timeout_s
     last_error = None
     while time.time() < deadline:
+        if server_process is not None and server_process.poll() is not None:
+            raise RuntimeError(
+                f"LeRobot server exited before becoming ready at {base_url}; "
+                f"returncode={server_process.returncode}"
+            )
         try:
+            health = client._post_json("/health", {})
+            if not expected_instance_token or health.get("instance_token") != expected_instance_token:
+                raise RuntimeError(
+                    f"Server instance mismatch at {base_url}: port is not owned by this evaluation"
+                )
+            actual_path = str(Path(health.get("policy_path", "")).expanduser().resolve())
+            if actual_path != expected_path:
+                raise RuntimeError(
+                    f"Port/model mismatch at {base_url}: expected {expected_path}, server has {actual_path}"
+                )
+            expected_contract = {
+                "state_shape": [64],
+                "action_shape": [52],
+                "image_shape": [3, 224, 224],
+                "chunk_size": 25,
+                "n_action_steps": 25,
+                "obs_delta_sequence": list(range(9, -1, -1)),
+            }
+            mismatches = {
+                key: (health.get(key), expected)
+                for key, expected in expected_contract.items()
+                if health.get(key) != expected
+            }
+            if mismatches:
+                raise RuntimeError(f"ACT RefPose 52D server contract mismatch: {mismatches}")
             client.reset()
+            print(
+                f"[act_refpose] server verified url={base_url} model={actual_path} "
+                "input=10x64 image=3x224x224 output=25x52"
+            )
             return
         except Exception as exc:
             last_error = exc
@@ -103,6 +147,8 @@ def _start_server(args, model_path: str, log_path: Path):
     server_script = Path(args.server_script).expanduser().resolve()
     server_env, launch_device = _build_server_env(args)
     server_env["PYTHONUNBUFFERED"] = "1"
+    instance_token = uuid.uuid4().hex
+    server_env["ACT_REFPOSE_SERVER_INSTANCE_TOKEN"] = instance_token
     cmd = [
         args.server_python,
         "-u",
@@ -130,6 +176,7 @@ def _start_server(args, model_path: str, log_path: Path):
         cwd=str(server_script.parent),
         env=server_env,
     )
+    process.act_refpose_instance_token = instance_token
     return process, log_fp
 
 
@@ -714,6 +761,8 @@ def main() -> int:
                     server_url,
                     timeout_s=args.server_ready_timeout,
                     verify_ssl=args.lerobot_server_verify_ssl,
+                    expected_model_path=resolved_model_path,
+                    server_process=server_proc,
                 )
                 episode_index = 0
                 for seed in args.seeds:

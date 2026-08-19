@@ -135,7 +135,7 @@ def load_source(path: Path, datasets_root: Path) -> SourceDataset:
     validate_dataset_dir(path)
     try:
         rel = path.relative_to(datasets_root.resolve())
-        task_name = rel.parts[0] if len(rel.parts) >= 2 else path.parent.name
+        task_name = rel.parts[0] if rel.parts else path.parent.name
     except ValueError:
         task_name = path.parent.name
     return SourceDataset(
@@ -155,6 +155,20 @@ def discover_datasets(args: argparse.Namespace) -> list[Path]:
 
     paths: list[Path] = []
     for task_dir in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        # Flat release layout: each first-level task directory is already a
+        # complete LeRobot dataset. A backend-specific root name (for example
+        # HumanoidArena_lerobot_sonic) identifies the family for --mode.
+        if (task_dir / "meta" / "info.json").is_file():
+            root_name = root.name.lower()
+            task_name = task_dir.name.lower()
+            if args.mode == "all":
+                paths.append(task_dir)
+            elif args.mode == "sonic" and ("sonic" in root_name or "sonic" in task_name):
+                paths.append(task_dir)
+            elif args.mode == "twist2" and ("twist2" in root_name or "twist2" in task_name):
+                paths.append(task_dir)
+            continue
+
         for dataset_dir in sorted(p for p in task_dir.iterdir() if p.is_dir() and not p.name.startswith(".")):
             if not (dataset_dir / "meta" / "info.json").exists():
                 continue

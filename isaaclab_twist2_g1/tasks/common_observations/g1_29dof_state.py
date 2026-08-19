@@ -80,14 +80,16 @@ def get_robot_arm_joint_names() -> list[str]:
         "right_wrist_yaw_joint",
     ]
 
-# global variable to cache the DDS instance
-from dds.dds_master import dds_manager
+# Global variable to cache the optional DDS instance.  Do not import the
+# hardware-only Unitree SDK while registering simulation tasks: evaluation
+# machines do not need it unless DDS publishing is actually requested.
+dds_manager = None
 _g1_robot_dds = None
 _dds_initialized = False
 
 def _get_g1_robot_dds_instance():
     """get the DDS instance, delay initialization"""
-    global _g1_robot_dds, _dds_initialized
+    global dds_manager, _g1_robot_dds, _dds_initialized
     
     if not _dds_initialized or _g1_robot_dds is None:
         try:

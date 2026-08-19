@@ -25,12 +25,12 @@ SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onn
 SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
 
 DEFAULT_SERVER_PYTHON="python"
-if [[ -x "/home/user/anaconda3/envs/lerobot/bin/python" ]]; then
-  DEFAULT_SERVER_PYTHON="/home/user/anaconda3/envs/lerobot/bin/python"
+if [[ -x "/root/miniconda3/envs/lerobot/bin/python" ]]; then
+  DEFAULT_SERVER_PYTHON="/root/miniconda3/envs/lerobot/bin/python"
 fi
 SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
 SERVER_SCRIPT="${ISAACLAB_ROOT}/../lerobot/scripts/serve_lerobot_vla_http.py"
-SERVER_DEVICE="cuda:0"
+SERVER_DEVICE="${SERVER_DEVICE:-cuda:0}"
 SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-${LEROBOT_VLA_SRC:-}}"
 if [[ -z "${SERVER_LEROBOT_SRC}" && -d "${ISAACLAB_ROOT}/../../fym/vla/src" ]]; then
   SERVER_LEROBOT_SRC="$(cd "${ISAACLAB_ROOT}/../../fym/vla/src" && pwd)"

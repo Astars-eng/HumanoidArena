@@ -4,16 +4,30 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-
 ISAACLAB_ROOT = Path(__file__).resolve().parents[1]
 if str(ISAACLAB_ROOT) not in sys.path:
     sys.path.insert(0, str(ISAACLAB_ROOT))
 
-from action_provider.sonic_raw_policy_adapter import (  # noqa: E402
+from action_provider.sonic_raw_policy_adapter import (
+    advance_hand_alpha,
     build_sonic_raw_policy_observation,
+    hand_alpha_to_joint_targets,
+    reorder_sonic_joint_vector_to_mujoco,
     sonic_raw_body_to_joint_targets,
+    split_sonic_raw95_policy_action,
     split_sonic_raw_policy_action,
 )
+
+
+def test_reorder_sonic_joint_vector_to_mujoco_matches_dataset_converter():
+    sonic = np.arange(29, dtype=np.float32)
+    expected = sonic[
+        [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28]
+    ]
+
+    np.testing.assert_array_equal(
+        reorder_sonic_joint_vector_to_mujoco(sonic, "joint_pos"), expected
+    )
 
 
 def test_split_sonic_raw_policy_action_preserves_all_dimensions():
@@ -24,6 +38,44 @@ def test_split_sonic_raw_policy_action_preserves_all_dimensions():
     np.testing.assert_array_equal(split.encoder_token, action[29:93])
     np.testing.assert_array_equal(split.left_hand, action[93:100])
     np.testing.assert_array_equal(split.right_hand, action[100:107])
+
+
+def test_split_sonic_raw95_policy_action_preserves_all_dimensions():
+    action = np.arange(95, dtype=np.float32)
+    split = split_sonic_raw95_policy_action(action)
+
+    np.testing.assert_array_equal(split.body_raw, action[:29])
+    np.testing.assert_array_equal(split.motion_token, action[29:93])
+    np.testing.assert_array_equal(split.hand_score, action[93:95])
+
+
+def test_hand_alpha_to_joint_targets_interpolates_and_clips():
+    open_pose = np.zeros(7, dtype=np.float32)
+    close_pose = np.arange(1, 8, dtype=np.float32)
+
+    np.testing.assert_allclose(
+        hand_alpha_to_joint_targets(0.25, open_pose=open_pose, close_pose=close_pose),
+        close_pose * 0.25,
+    )
+    np.testing.assert_array_equal(
+        hand_alpha_to_joint_targets(-1.0, open_pose=open_pose, close_pose=close_pose), open_pose
+    )
+    np.testing.assert_array_equal(
+        hand_alpha_to_joint_targets(2.0, open_pose=open_pose, close_pose=close_pose), close_pose
+    )
+
+
+def test_advance_hand_alpha_matches_collector_slew():
+    assert advance_hand_alpha(0.0, True, step=0.05) == pytest.approx(0.05)
+    assert advance_hand_alpha(0.98, True, step=0.05) == pytest.approx(1.0)
+    assert advance_hand_alpha(0.4, False, step=0.05) == pytest.approx(0.35)
+    assert advance_hand_alpha(0.02, False, step=0.05) == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("step", [0.0, -0.05, 1.01, np.nan])
+def test_advance_hand_alpha_rejects_invalid_step(step):
+    with pytest.raises(ValueError):
+        advance_hand_alpha(0.0, True, step=step)
 
 
 def test_raw_body_conversion_matches_sonic_deploy_formula_without_clipping():
@@ -62,3 +114,9 @@ def test_raw_observation_layout_and_components_are_identical():
 def test_invalid_raw_action_fails_closed(bad):
     with pytest.raises(ValueError):
         split_sonic_raw_policy_action(bad)
+
+
+@pytest.mark.parametrize("bad", [np.zeros(94), np.full(95, np.nan)])
+def test_invalid_raw95_action_fails_closed(bad):
+    with pytest.raises(ValueError):
+        split_sonic_raw95_policy_action(bad)

@@ -10,12 +10,51 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
 SONIC_RAW_POLICY_STATE_DIM = 64
 SONIC_RAW_POLICY_ACTION_DIM = 107
+SONIC_RAW95_POLICY_ACTION_DIM = 95
+SONIC_RAW29_POLICY_ACTION_DIM = 29
 SONIC_RAW_BODY_ACTION_DIM = 29
 SONIC_RAW_ENCODER_TOKEN_DIM = 64
 SONIC_RAW_HAND_ACTION_DIM = 7
+
+# Index a 29-D vector recorded in SONIC IsaacLab order to obtain the
+# DFS/MuJoCo order used by the corrected HumanoidArena LeRobot datasets.
+SONIC_TO_MUJOCO_JOINT_INDEX = np.asarray(
+    [
+        0,
+        3,
+        6,
+        9,
+        13,
+        17,
+        1,
+        4,
+        7,
+        10,
+        14,
+        18,
+        2,
+        5,
+        8,
+        11,
+        15,
+        19,
+        21,
+        23,
+        25,
+        27,
+        12,
+        16,
+        20,
+        22,
+        24,
+        26,
+        28,
+    ],
+    dtype=np.int64,
+)
+MUJOCO_TO_SONIC_JOINT_INDEX = np.argsort(SONIC_TO_MUJOCO_JOINT_INDEX).astype(np.int64)
 
 SONIC_RAW_STATE_KEYS = (
     "observation.joint_pos",
@@ -34,6 +73,20 @@ def _finite_vector(value: np.ndarray, size: int, name: str) -> np.ndarray:
     return vector
 
 
+def reorder_sonic_joint_vector_to_mujoco(value: np.ndarray, name: str) -> np.ndarray:
+    """Reorder one finite 29-D joint vector from SONIC to DFS/MuJoCo order."""
+
+    vector = _finite_vector(value, SONIC_RAW_BODY_ACTION_DIM, name)
+    return vector[SONIC_TO_MUJOCO_JOINT_INDEX].astype(np.float32, copy=True)
+
+
+def reorder_mujoco_joint_vector_to_sonic(value: np.ndarray, name: str) -> np.ndarray:
+    """Reorder one DFS/MuJoCo 29-D vector to SONIC IsaacLab order."""
+
+    vector = _finite_vector(value, SONIC_RAW_BODY_ACTION_DIM, name)
+    return vector[MUJOCO_TO_SONIC_JOINT_INDEX].astype(np.float32, copy=True)
+
+
 @dataclass(frozen=True)
 class SonicRawPolicyAction:
     """Named views of the checkpoint's concatenated 107-D output."""
@@ -42,6 +95,19 @@ class SonicRawPolicyAction:
     encoder_token: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+
+
+@dataclass(frozen=True)
+class SonicRaw95PolicyAction:
+    """Named views of the ACT95 ``29 + 64 + 2`` output.
+
+    The final two values are the dataset's left/right binary hand targets.
+    Deployment converts those targets to continuous hand trajectories.
+    """
+
+    body_raw: np.ndarray
+    motion_token: np.ndarray
+    hand_score: np.ndarray
 
 
 def split_sonic_raw_policy_action(action: np.ndarray) -> SonicRawPolicyAction:
@@ -57,6 +123,50 @@ def split_sonic_raw_policy_action(action: np.ndarray) -> SonicRawPolicyAction:
         left_hand=vector[token_end:left_end].copy(),
         right_hand=vector[left_end:].copy(),
     )
+
+
+def split_sonic_raw95_policy_action(action: np.ndarray) -> SonicRaw95PolicyAction:
+    """Split the ACT95 output without changing values or joint order."""
+
+    vector = _finite_vector(action, SONIC_RAW95_POLICY_ACTION_DIM, "SONIC raw95 policy action")
+    body_end = SONIC_RAW_BODY_ACTION_DIM
+    token_end = body_end + SONIC_RAW_ENCODER_TOKEN_DIM
+    return SonicRaw95PolicyAction(
+        body_raw=vector[:body_end].copy(),
+        motion_token=vector[body_end:token_end].copy(),
+        hand_score=vector[token_end:].copy(),
+    )
+
+
+def hand_alpha_to_joint_targets(
+    alpha: float,
+    *,
+    open_pose: np.ndarray,
+    close_pose: np.ndarray,
+) -> np.ndarray:
+    """Map one continuous hand close fraction to its robot joint target."""
+
+    open_vector = _finite_vector(open_pose, SONIC_RAW_HAND_ACTION_DIM, "open hand pose")
+    close_vector = _finite_vector(close_pose, SONIC_RAW_HAND_ACTION_DIM, "close hand pose")
+    alpha_value = float(alpha)
+    if not np.isfinite(alpha_value):
+        raise ValueError("hand alpha must be finite")
+    alpha_value = float(np.clip(alpha_value, 0.0, 1.0))
+    return (open_vector + alpha_value * (close_vector - open_vector)).astype(np.float32)
+
+
+def advance_hand_alpha(current_alpha: float, closed_target: bool, *, step: float) -> float:
+    """Advance a hand close fraction exactly one collection-time control tick."""
+
+    current = float(current_alpha)
+    step_value = float(step)
+    if not np.isfinite(current) or not np.isfinite(step_value):
+        raise ValueError("hand alpha and interpolation step must be finite")
+    if step_value <= 0.0 or step_value > 1.0:
+        raise ValueError("hand interpolation step must be in (0, 1]")
+    target = 1.0 if closed_target else 0.0
+    delta = float(np.clip(target - current, -step_value, step_value))
+    return float(np.clip(current + delta, 0.0, 1.0))
 
 
 def sonic_raw_body_to_joint_targets(

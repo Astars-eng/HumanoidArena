@@ -131,6 +131,13 @@ parser.add_argument(
     choices=["native_decoder", "direct_raw"],
     help="raw107 body interface: close the loop through the native SONIC decoder or audit direct raw29",
 )
+parser.add_argument(
+    "--sonic_raw_state_joint_order",
+    type=str,
+    default=os.environ.get("SONIC_RAW_STATE_JOINT_ORDER", "sonic"),
+    choices=["sonic", "mujoco"],
+    help="29-D joint order expected by a raw64/raw107 checkpoint observation",
+)
 parser.add_argument("--lerobot_server_url", type=str, default="",
                     help="HTTP(S) endpoint for remote LeRobot VLA inference")
 parser.add_argument("--lerobot_server_timeout", type=float, default=5.0,
@@ -879,7 +886,8 @@ def main():
                 "VLA runtime schema: sonic_raw107, observation.state="
                 "[q29, qd29, ang_vel_b3, gravity3], action="
                 "[decoder_raw29, encoder64, left_hand7, right_hand7], body_source="
-                f"{args_cli.sonic_raw107_body_source}"
+                f"{args_cli.sonic_raw107_body_source}, state_joint_order="
+                f"{args_cli.sonic_raw_state_joint_order}"
             )
         else:
             print("VLA runtime schema: unitree_g1_gmt_refpose_v3_1, observation.state=64D, action=40D ref-pose local output")

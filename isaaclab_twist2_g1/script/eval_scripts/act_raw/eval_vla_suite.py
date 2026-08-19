@@ -126,7 +126,10 @@ def _build_sim_env(args) -> tuple[dict[str, str], str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    # Keep all GPUs visible for Vulkan/RTX interop; sim_eval_vla sets the renderer activeGpu.
+    # Vulkan keeps physical GPU ordinals even when CUDA_VISIBLE_DEVICES remaps
+    # CUDA ordinals.  Keep every GPU visible so RTX, PhysX, Warp and CUDA agree
+    # on the physical index selected by AppLauncher.
+    env.pop("CUDA_VISIBLE_DEVICES", None)
     return env, str(args.isaac_device or "").strip()
 
 
@@ -859,6 +862,10 @@ def main() -> int:
         f"[eval_vla_suite] completed episodes={total_episodes} successes={total_successes} "
         f"success_rate={overall_rate:.4f} results_dir={run_dir}"
     )
+    process_errors = sum(row.get("failure_reason") == "process_error" for row in results)
+    if process_errors:
+        print(f"[eval_vla_suite] failed process_errors={process_errors}", file=sys.stderr)
+        return 1
     return 0
 
 

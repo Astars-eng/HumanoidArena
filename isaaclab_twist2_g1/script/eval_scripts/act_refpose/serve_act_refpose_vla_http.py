@@ -66,6 +66,108 @@ _TASK_NAME_ALIASES = (
 )
 
 _HTTP_INFERENCE_IMAGE_TRANSFORM_TYPES = {"Resize", "Pad"}
+_EXTENDED_ACT_CONFIG_FIELDS = {"state_keys", "action_keys", "obs_delta_sequence"}
+_EXPECTED_STATE_KEYS = [
+    "observation.joint_pos",
+    "observation.joint_vel",
+    "observation.ang_vel_b",
+    "observation.gravity",
+]
+_EXPECTED_STATE_COMPONENT_DIMS = [29, 29, 3, 3]
+_EXPECTED_ACTION_KEYS = ["action"]
+_EXPECTED_OBS_DELTA_SEQUENCE = list(range(9, -1, -1))
+_EXPECTED_STATE_SHAPE = (64,)
+_EXPECTED_ACTION_SHAPE = (52,)
+_EXPECTED_IMAGE_SHAPE = (3, 224, 224)
+_EXPECTED_CHUNK_STEPS = 25
+
+
+def _resize_rgb_image_to_policy_shape(
+    image: np.ndarray,
+    expected_chw_shape: tuple[int, ...] | None,
+) -> tuple[np.ndarray, bool]:
+    """Match HTTP RGB input to the spatial shape used by the checkpoint."""
+
+    rgb = np.asarray(image)
+    if rgb.ndim != 3 or rgb.shape[-1] not in (3, 4):
+        raise ValueError(f"Expected HWC image with 3 or 4 channels, got {rgb.shape}")
+    rgb = np.ascontiguousarray(rgb[..., :3])
+    if expected_chw_shape is None:
+        return rgb, False
+    if len(expected_chw_shape) != 3:
+        raise ValueError(f"Policy image feature must have CHW shape, got {expected_chw_shape}")
+
+    channels, target_height, target_width = (int(value) for value in expected_chw_shape)
+    if channels != 3 or target_height <= 0 or target_width <= 0:
+        raise ValueError(f"Unsupported policy image feature shape {expected_chw_shape}")
+    if rgb.shape[:2] == (target_height, target_width):
+        return rgb, False
+
+    # Dataset conversion uses cv2.INTER_AREA when shrinking a full RGB frame
+    # and cv2.INTER_LINEAR when enlarging it. Reproduce that operation exactly
+    # so every HTTP entry point sees the same pixels as training.
+    import cv2
+
+    interpolation = (
+        cv2.INTER_AREA
+        if rgb.shape[0] >= target_height and rgb.shape[1] >= target_width
+        else cv2.INTER_LINEAR
+    )
+    resized = cv2.resize(rgb, (target_width, target_height), interpolation=interpolation)
+    return np.ascontiguousarray(resized), True
+
+
+def _checkpoint_config_fields(policy_dir: Path) -> set[str]:
+    config_path = policy_dir / "config.json"
+    try:
+        payload = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to read policy config: {config_path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Policy config must contain a JSON object: {config_path}")
+    return set(payload)
+
+
+def _supports_extended_act_config(lerobot_src: Path) -> bool:
+    config_path = lerobot_src / "lerobot" / "policies" / "act" / "configuration_act.py"
+    concat_processor_path = lerobot_src / "lerobot" / "processor" / "concat_processor.py"
+    try:
+        config_source = config_path.read_text()
+    except OSError:
+        return False
+    return concat_processor_path.is_file() and all(
+        f"{field_name}:" in config_source for field_name in _EXTENDED_ACT_CONFIG_FIELDS
+    )
+
+
+def _resolve_lerobot_src(policy_dir: Path) -> Path:
+    lerobot_src_override = os.environ.get("LEROBOT_VLA_SRC", "").strip()
+    bundled_src = Path(__file__).resolve().parents[4] / "lerobot" / "src"
+    sibling_training_src = Path(__file__).resolve().parents[4].parent / "vla" / "src"
+    requires_extended_act = _EXTENDED_ACT_CONFIG_FIELDS.issubset(_checkpoint_config_fields(policy_dir))
+
+    if lerobot_src_override:
+        lerobot_src = Path(lerobot_src_override).expanduser().resolve()
+        source_reason = "LEROBOT_VLA_SRC"
+    elif requires_extended_act and _supports_extended_act_config(sibling_training_src):
+        lerobot_src = sibling_training_src.resolve()
+        source_reason = "extended ACT checkpoint"
+    else:
+        lerobot_src = bundled_src.resolve()
+        source_reason = "bundled default"
+
+    if not lerobot_src.is_dir():
+        raise FileNotFoundError(f"LeRobot src directory not found: {lerobot_src}")
+    if requires_extended_act and not _supports_extended_act_config(lerobot_src):
+        fields = ", ".join(sorted(_EXTENDED_ACT_CONFIG_FIELDS))
+        raise RuntimeError(
+            f"Checkpoint requires the extended ACT config fields ({fields}), but the selected LeRobot "
+            f"source is incompatible: {lerobot_src}. Set LEROBOT_VLA_SRC to the training repository's src "
+            "directory (for this workspace: /DATA/disk0/fym/vla/src)."
+        )
+
+    print(f"[lerobot_vla_server] using LeRobot src {lerobot_src} ({source_reason})", flush=True)
+    return lerobot_src
 
 
 def _remap_legacy_checkpoint_ref(value):
@@ -361,14 +463,7 @@ def _load_server_image_transform(policy_dir: Path) -> ServerImageTransform | Non
 
 
 def _load_policy(policy_dir: Path, device_name: str):
-    lerobot_src_override = os.environ.get("LEROBOT_VLA_SRC", "").strip()
-    lerobot_src = (
-        Path(lerobot_src_override).expanduser().resolve()
-        if lerobot_src_override
-        else Path(__file__).resolve().parents[4] / "lerobot" / "src"
-    )
-    if not lerobot_src.is_dir():
-        raise FileNotFoundError(f"LeRobot src directory not found: {lerobot_src}")
+    lerobot_src = _resolve_lerobot_src(policy_dir)
     if str(lerobot_src) not in sys.path:
         sys.path.insert(0, str(lerobot_src))
 
@@ -418,6 +513,8 @@ def _load_policy(policy_dir: Path, device_name: str):
 
 class LeRobotServerState:
     def __init__(self, policy_dir: Path, device_name: str):
+        self.policy_dir = policy_dir.resolve()
+        self.instance_token = os.environ.get("ACT_REFPOSE_SERVER_INSTANCE_TOKEN", "").strip()
         (
             self.config,
             self.policy,
@@ -430,7 +527,17 @@ class LeRobotServerState:
         self.expected_state_shape = _feature_shape_dim(self.config.input_features.get("observation.state"))
         self.expected_history_steps = int(getattr(self.config, "n_obs_steps", 1) or 1)
         self.expected_action_shape = _feature_shape_dim(self.config.output_features.get("action"))
+        self.expected_image_shape = _feature_shape_dim(
+            self.config.input_features.get("observation.images.front")
+        )
+        self.state_component_slices = self._build_state_component_slices()
+        self._validate_act_refpose_contract()
         self.http_image_transform = _load_server_image_transform(policy_dir)
+        if self.expected_image_shape is not None:
+            print(
+                f"[lerobot_vla_server] enforced HTTP image CHW shape={self.expected_image_shape}",
+                flush=True,
+            )
         self.default_task_name, self.default_task_instruction = _infer_task_instruction_from_policy_path(policy_dir)
         if self.default_task_instruction:
             print(
@@ -461,6 +568,62 @@ class LeRobotServerState:
         self.current_seed: int | None = None
         self.reset()
 
+    def _validate_act_refpose_contract(self) -> None:
+        policy_type = str(getattr(self.config, "type", "") or "").strip().lower()
+        state_keys = list(getattr(self.config, "state_keys", []) or [])
+        action_keys = list(getattr(self.config, "action_keys", []) or [])
+        obs_delta_sequence = list(getattr(self.config, "obs_delta_sequence", []) or [])
+        chunk_size = int(getattr(self.config, "chunk_size", 0) or 0)
+        n_action_steps = int(getattr(self.config, "n_action_steps", 0) or 0)
+
+        errors = []
+        checks = (
+            ("type", policy_type, "act"),
+            ("state_keys", state_keys, _EXPECTED_STATE_KEYS),
+            ("action_keys", action_keys, _EXPECTED_ACTION_KEYS),
+            ("obs_delta_sequence", obs_delta_sequence, _EXPECTED_OBS_DELTA_SEQUENCE),
+            ("n_obs_steps", self.expected_history_steps, len(_EXPECTED_OBS_DELTA_SEQUENCE)),
+            ("observation.state shape", self.expected_state_shape, _EXPECTED_STATE_SHAPE),
+            ("action shape", self.expected_action_shape, _EXPECTED_ACTION_SHAPE),
+            ("observation.images.front shape", self.expected_image_shape, _EXPECTED_IMAGE_SHAPE),
+            ("chunk_size", chunk_size, _EXPECTED_CHUNK_STEPS),
+            ("n_action_steps", n_action_steps, _EXPECTED_CHUNK_STEPS),
+        )
+        for label, actual, expected in checks:
+            if actual != expected:
+                errors.append(f"{label}={actual!r}, expected {expected!r}")
+
+        component_dims = [item.stop - item.start for _, item in self.state_component_slices]
+        if component_dims != _EXPECTED_STATE_COMPONENT_DIMS:
+            errors.append(
+                f"state component dims={component_dims!r}, expected {_EXPECTED_STATE_COMPONENT_DIMS!r}"
+            )
+        if errors:
+            raise ValueError(
+                "Checkpoint is incompatible with act_refpose 52D:\n  - " + "\n  - ".join(errors)
+            )
+        print(
+            "[act_refpose_server] contract validated "
+            "input=10x64(joint_pos29+joint_vel29+ang_vel_b3+gravity3) "
+            "image=3x224x224 output=25x52(root9+joint29+left_hand7+right_hand7)",
+            flush=True,
+        )
+
+    def health_payload(self) -> dict:
+        return {
+            "ok": True,
+            "instance_token": self.instance_token,
+            "policy_path": str(self.policy_dir),
+            "policy_type": str(getattr(self.config, "type", "")),
+            "state_keys": list(getattr(self.config, "state_keys", []) or []),
+            "obs_delta_sequence": list(getattr(self.config, "obs_delta_sequence", []) or []),
+            "state_shape": list(self.expected_state_shape or ()),
+            "action_shape": list(self.expected_action_shape or ()),
+            "image_shape": list(self.expected_image_shape or ()),
+            "chunk_size": int(getattr(self.config, "chunk_size", 0) or 0),
+            "n_action_steps": int(getattr(self.config, "n_action_steps", 0) or 0),
+        }
+
     def _seed_runtime(self, seed: int) -> None:
         normalized_seed = int(seed) & 0xFFFFFFFF
         random.seed(normalized_seed)
@@ -490,6 +653,37 @@ class LeRobotServerState:
         if dtype_name in {"float32", "fp32", "float"}:
             return torch.float32
         return None
+
+    def _build_state_component_slices(self) -> list[tuple[str, slice]]:
+        state_keys = list(getattr(self.config, "state_keys", []) or [])
+        if not state_keys or state_keys == ["observation.state"]:
+            return []
+
+        component_slices = []
+        offset = 0
+        for key in state_keys:
+            shape = _feature_shape_dim(self.config.input_features.get(key))
+            if shape is None or len(shape) != 1:
+                raise ValueError(f"State component {key!r} must have a one-dimensional feature shape, got {shape}")
+            next_offset = offset + shape[0]
+            component_slices.append((key, slice(offset, next_offset)))
+            offset = next_offset
+
+        expected_dim = self.expected_state_shape[0] if self.expected_state_shape else None
+        if expected_dim is not None and offset != expected_dim:
+            raise ValueError(
+                f"Configured state components total {offset} dimensions, but observation.state has {expected_dim}"
+            )
+        return component_slices
+
+    def _add_state_components(self, observation: dict) -> dict:
+        if not self.state_component_slices or "observation.state" not in observation:
+            return observation
+        observation = dict(observation)
+        state = observation["observation.state"]
+        for key, component_slice in self.state_component_slices:
+            observation[key] = state[..., component_slice]
+        return observation
 
     def _amp_context(self):
         if self.device.type != "cuda" or not self._use_amp:
@@ -715,6 +909,7 @@ class LeRobotServerState:
         return self.default_task_name, self.default_task_instruction
 
     def _prepare_observation(self, observation: dict, robot_type: str, task: str | None):
+        observation = self._add_state_components(observation)
         prepared = self.prepare_observation_for_inference(copy(observation), self.device, task, robot_type)
         raw_state = prepared.get("observation.state")
         if raw_state is not None:
@@ -773,6 +968,11 @@ def make_handler(state: LeRobotServerState):
 
         def do_POST(self):
             try:
+                if self.path == "/health":
+                    self._read_json()
+                    self._send_json(200, state.health_payload())
+                    return
+
                 if self.path == "/reset":
                     payload = self._read_json()
                     reset_seed = payload.get("seed")
@@ -793,6 +993,10 @@ def make_handler(state: LeRobotServerState):
                 raw_image_shape = tuple(image.shape)
                 if state.http_image_transform is not None:
                     image = state.http_image_transform(image)
+                image, image_resize_applied = _resize_rgb_image_to_policy_shape(
+                    image,
+                    state.expected_image_shape,
+                )
                 observation_state = np.asarray(payload["observation"]["state"], dtype=np.float32).copy()
                 if state.expected_state_shape is not None:
                     valid_shapes = {tuple(state.expected_state_shape)}
@@ -816,7 +1020,7 @@ def make_handler(state: LeRobotServerState):
                         f"[lerobot_vla_server] first_infer peer={self.client_address} robot_type={robot_type} "
                         f"task_name={task_name} task={task_instruction!r} "
                         f"state_shape={tuple(observation_state.shape)} raw_image_shape={raw_image_shape} "
-                        f"image_shape={tuple(image.shape)}",
+                        f"image_shape={tuple(image.shape)} image_resize_applied={int(image_resize_applied)}",
                         flush=True,
                     )
 

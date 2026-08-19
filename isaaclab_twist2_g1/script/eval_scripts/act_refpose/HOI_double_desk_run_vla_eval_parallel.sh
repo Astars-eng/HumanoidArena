@@ -6,10 +6,10 @@ RUN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISAACLAB_ROOT="$(cd "${RUN_SCRIPT_DIR}/../../.." && pwd)"
 source "${RUN_SCRIPT_DIR}/../common/model_batch_utils.sh"
 
-CONDA_BASE="${CONDA_BASE:-/ai/Yichi/0_Systems/miniconda3}"
+CONDA_BASE="${CONDA_BASE:-}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-unitree_sim_env}"
 AUTO_ACTIVATE_CONDA="${AUTO_ACTIVATE_CONDA:-1}"
-if [[ "${AUTO_ACTIVATE_CONDA}" == "1" ]]; then
+if [[ "${AUTO_ACTIVATE_CONDA}" == "1" && -n "${CONDA_BASE}" && -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]]; then
   TARGET_CONDA_PREFIX="${CONDA_BASE}/envs/${CONDA_ENV_NAME}"
   if [[ "${CONDA_PREFIX:-}" != "${TARGET_CONDA_PREFIX}" ]]; then
     export ZSH_VERSION="${ZSH_VERSION:-}"
@@ -28,7 +28,7 @@ if [[ -d "${NVIDIA_ROOT}" ]]; then
   export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-${NVIDIA_ROOT}/share/vulkan/icd.d/nvidia_icd.json}"
 fi
 
-EVAL_PYTHON="${EVAL_PYTHON:-python}"
+EVAL_PYTHON="${EVAL_PYTHON:-${ISAACLAB_PYTHON}}"
 
 resolve_config_path() {
   local config_path="$1"
@@ -48,7 +48,7 @@ ENABLE_DEPTH="${ENABLE_DEPTH:-0}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 VIDEO_FPS="${VIDEO_FPS:-30}"
 POST_TERMINATION_RECORD_STEPS="${POST_TERMINATION_RECORD_STEPS:-10}"
-RECORD_VIDEO_EVERY_N="${RECORD_VIDEO_EVERY_N:-10}"
+RECORD_VIDEO_EVERY_N="${RECORD_VIDEO_EVERY_N:-1}"
 STEP_LOG_EVERY_N="${STEP_LOG_EVERY_N:-100}"
 SIM_VERBOSE_STARTUP="${SIM_VERBOSE_STARTUP:-0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -61,14 +61,10 @@ ACT_REFPOSE_HISTORY_STEPS="${ACT_REFPOSE_HISTORY_STEPS:-10}"
 ACT_REFPOSE_EXECUTE_STEPS="${ACT_REFPOSE_EXECUTE_STEPS:-5}"
 ACT_REFPOSE_RECORD_FULL_CHUNKS="${ACT_REFPOSE_RECORD_FULL_CHUNKS:-1}"
 
-SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-/ai/Yichi/taowen/HumanoidArena/GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/model_encoder.onnx}"
-SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-/ai/Yichi/taowen/HumanoidArena/GR00T-WholeBodyControl/gear_sonic_deploy/policy/release/model_decoder.onnx}"
+SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onnx}"
+SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
 
-DEFAULT_SERVER_PYTHON="python"
-if [[ -x "/home/user/anaconda3/envs/lerobot/bin/python" ]]; then
-  DEFAULT_SERVER_PYTHON="/home/user/anaconda3/envs/lerobot/bin/python"
-fi
-SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
+SERVER_PYTHON="${SERVER_PYTHON:-python}"
 SERVER_SCRIPT="${SERVER_SCRIPT:-${RUN_SCRIPT_DIR}/serve_act_refpose_vla_http.py}"
 SERVER_GPU_IDS="${SERVER_GPU_IDS:-0,1,2,3,4,5,6,7}"
 SERVER_DEVICE="${SERVER_DEVICE:-cuda:0}"
@@ -80,19 +76,27 @@ LEROBOT_VERIFY_SSL="${LEROBOT_VERIFY_SSL:-0}"
 TLS_CERT_FILE="${TLS_CERT_FILE:-}"
 TLS_KEY_FILE="${TLS_KEY_FILE:-}"
 
+DEFAULT_CHECKPOINT="${HUMANOIDARENA_ROOT}/../vla/outputs/act_refpose_humanoidarena_lerobot/HOI_double_desk_20260812_161940/checkpoints/200000/pretrained_model"
+if [[ -n "${MODEL_PATH:-}" && -z "${MODEL_PATHS_CSV:-}" ]]; then
+  MODEL_PATHS_CSV="${MODEL_PATH}"
+elif [[ -z "${MODEL_PATHS_CSV:-}" && -z "${MODEL_PATHS_FILE:-}" && -z "${MODEL_ROOT:-}" ]]; then
+  MODEL_PATHS_CSV="${DEFAULT_CHECKPOINT}"
+fi
 MODEL_ROOT="${MODEL_ROOT:-$DEFAULT_BATCH_MODEL_ROOT}"
 MODEL_GLOB="${MODEL_GLOB:-}"
-RESULTS_TAG_BASE="${RESULTS_TAG:-1test_HOI_double_desk_sonic_batch_2000_mix}"
+RESULTS_TAG_BASE="${RESULTS_TAG:-HOI_double_desk_sonic_batch_2000_mix}"
 if [[ -n "${RESULTS_TAG_PREFIX:-}" ]]; then
   RESULTS_TAG="${RESULTS_TAG_PREFIX}_${RESULTS_TAG_BASE}"
 else
   RESULTS_TAG="${RESULTS_TAG_BASE}"
 fi
-RESUME_LATEST="${RESUME_LATEST:-1}"
+# Start a fresh, timestamped result directory by default. Set
+# RESUME_LATEST=1 explicitly when an interrupted evaluation should resume.
+RESUME_LATEST="${RESUME_LATEST:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
-if [[ -z "${LEROBOT_VLA_SRC:-}" && -d "${ISAACLAB_ROOT}/../../fym/vla/src" ]]; then
-  export LEROBOT_VLA_SRC="$(cd "${ISAACLAB_ROOT}/../../fym/vla/src" && pwd)"
+if [[ -z "${LEROBOT_VLA_SRC:-}" && -d "${ISAACLAB_ROOT}/../../vla/src" ]]; then
+  export LEROBOT_VLA_SRC="$(cd "${ISAACLAB_ROOT}/../../vla/src" && pwd)"
 fi
 
 resolve_results_dir() {
@@ -195,10 +199,24 @@ fi
 TASK_NAME="${TASK_NAME:-$(load_task_name_from_yaml "${ENV_CONFIG_YAML}")}"
 discover_model_paths "${MODEL_GLOB}"
 print_model_paths_summary
+for runtime_file in "${SONIC_ENCODER_PATH}" "${SONIC_DECODER_PATH}"; do
+  if [[ ! -f "${runtime_file}" ]]; then
+    echo "Error: required SONIC runtime model is missing: ${runtime_file}" >&2
+    exit 2
+  fi
+done
+"${EVAL_PYTHON}" -c 'import numpy as np; major=int(np.__version__.split(".",1)[0]); assert major < 2, f"Isaac Sim requires NumPy 1.x, got {np.__version__}"'
+for model_path in "${MODEL_PATHS[@]}"; do
+  "${SERVER_PYTHON}" "${RUN_SCRIPT_DIR}/refpose52_contract.py" "${model_path}"
+done
 
 RESULTS_DIR="$(resolve_results_dir)"
 echo "Task: ${TASK_NAME}"
 echo "Results dir: ${RESULTS_DIR}"
+echo "IsaacLab Python: ${EVAL_PYTHON}"
+echo "LeRobot server Python: ${SERVER_PYTHON}"
+echo "ACT RefPose contract: input=10x64 image=3x224x224 output=25x52 execute=${ACT_REFPOSE_EXECUTE_STEPS}"
+echo "Server ports: auto range ${SERVER_PORT_BASE}-${SERVER_PORT_MAX}"
 if [[ -d "${RESULTS_DIR}/episodes" ]]; then
   echo "Resume mode: reuse existing results in ${RESULTS_DIR}"
 fi

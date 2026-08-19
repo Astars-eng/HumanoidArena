@@ -20,6 +20,7 @@ from eval_vla_suite import (
     _wait_for_server_ready,
     _write_summary,
 )
+from refpose52_contract import validate_checkpoint
 
 
 
@@ -310,6 +311,8 @@ def _worker_run(task_spec: dict, args_dict: dict, run_dir_str: str) -> list[dict
                 server_url,
                 timeout_s=args.server_ready_timeout,
                 verify_ssl=args.lerobot_server_verify_ssl,
+                expected_model_path=task_spec['model_path'],
+                server_process=server_proc,
             )
         if args.persistent_sim:
             print(
@@ -431,6 +434,9 @@ def main() -> int:
 
     if args.num_workers <= 0:
         raise ValueError('--num_workers must be >= 1')
+
+    for model_path in args.model_paths:
+        validate_checkpoint(model_path)
 
     run_dir = Path(args.results_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)

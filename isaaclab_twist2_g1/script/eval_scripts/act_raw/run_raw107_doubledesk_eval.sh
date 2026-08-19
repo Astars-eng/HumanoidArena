@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DEFAULT_CHECKPOINTS=(
-  "/home/user/Documents/fym/vla/outputs/act_sonic_raw_20260804_fym/200000/pretrained_model"
+  "/DATA/disk0/fym/HumanoidArena/isaaclab_twist2_g1/script/eval_scripts/act_raw/eval_results/smoke_doubledesk/200000/pretrained_model"
 )
 
 if [[ "$#" -gt 0 ]]; then
@@ -26,8 +26,8 @@ export SONIC_RAW107_BODY_SOURCE="${SONIC_RAW107_BODY_SOURCE:-native_decoder}"
 # [parameter tuning] Pin the pre-existing optional delay to the neutral value so
 # the evaluation wrapper cannot silently change checkpoint timing via ambient env.
 export SONIC_OUTPUT_DELAY_STEPS="0"
-export SERVER_PYTHON="${SERVER_PYTHON:-/home/user/anaconda3/envs/lerobot/bin/python}"
-export SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-/home/user/Documents/fym/vla/src}"
+export SERVER_PYTHON="${SERVER_PYTHON:-/root/miniconda3/envs/lerobot/bin/python}"
+export SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-/DATA/disk0/fym/vla/src}"
 export SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-}"
 # [interface conversion] The dataset contains the literal HumanoidArena task ID;
 # do not replace it with a generic English alias at inference time.

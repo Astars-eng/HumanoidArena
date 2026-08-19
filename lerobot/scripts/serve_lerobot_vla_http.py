@@ -49,6 +49,7 @@ _TASK_NAME_ALIASES = (
     ("hoippbox", "HOI_pp_box"),
     ("ppbox", "HOI_pp_box"),
     ("pp_box", "HOI_pp_box"),
+    ("pickplacebox", "HOI_pp_box"),
     ("hsivisionnavi", "HSI_vision_navi"),
     ("visionnavi", "HSI_vision_navi"),
     ("vision_navi", "HSI_vision_navi"),
@@ -74,6 +75,7 @@ _HTTP_ROBOT_STATE_COMPONENT_KEYS = {
     "observation.joint_vel",
     "observation.ang_vel_b",
     "observation.gravity",
+    "observation.last_action",
 }
 
 
@@ -445,7 +447,45 @@ def _load_server_image_transform(policy_dir: Path) -> ServerImageTransform | Non
     return ServerImageTransform(transform_specs=transform_specs, summary=summary)
 
 
-def _load_policy(policy_dir: Path, device_name: str):
+def _disable_stream_action_delta_refiner(policy) -> None:
+    config = policy.config
+    if getattr(config, "type", None) != "stream":
+        raise ValueError(
+            "--disable-action-delta-refiner is only supported for Stream policies; "
+            f"got policy type {getattr(config, 'type', None)!r}"
+        )
+    if not bool(getattr(config, "action_delta_refiner_enabled", False)):
+        print(
+            "[lerobot_vla_server] action delta refiner runtime override requested, "
+            "but the checkpoint refiner is already disabled",
+            flush=True,
+        )
+        policy._action_delta_refiner_runtime_disabled = True
+        return
+    if not callable(getattr(policy, "refine_action_step", None)):
+        raise ValueError("Stream policy does not expose refine_action_step() for runtime bypass")
+
+    def _return_base_action(base_action, *_args, **_kwargs):
+        return base_action
+
+    # Keep the checkpoint architecture and its coarse-to-control-rate
+    # interpolation intact. Only bypass the per-control-step delta Refiner so
+    # this is a faithful base Action Expert ablation.
+    policy.refine_action_step = _return_base_action
+    policy._action_delta_refiner_runtime_disabled = True
+    print(
+        "[lerobot_vla_server] action delta refiner disabled by runtime bypass; "
+        "base Action Expert interpolation remains enabled",
+        flush=True,
+    )
+
+
+def _load_policy(
+    policy_dir: Path,
+    device_name: str,
+    *,
+    disable_action_delta_refiner: bool = False,
+):
     lerobot_src_override = os.environ.get("LEROBOT_VLA_SRC", "").strip()
     lerobot_src = (
         Path(lerobot_src_override).expanduser().resolve()
@@ -477,9 +517,15 @@ def _load_policy(policy_dir: Path, device_name: str):
 
     config = PreTrainedConfig.from_pretrained(effective_policy_dir)
     config.device = device_name
+
+    if getattr(config, "type", None) == "stream":
+      config.n_action_steps = 5
+
     policy_cls = get_policy_class(config.type)
 
     policy = policy_cls.from_pretrained(effective_policy_dir, config=config)
+    if disable_action_delta_refiner:
+        _disable_stream_action_delta_refiner(policy)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
         effective_policy_dir,
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
@@ -510,6 +556,7 @@ class LeRobotServerState:
         *,
         verbatim_task: bool = False,
         stretch_image_to_policy_shape: bool = False,
+        disable_action_delta_refiner: bool = False,
     ):
         (
             self.config,
@@ -519,13 +566,18 @@ class LeRobotServerState:
             self.predict_action,
             self.prepare_observation_for_inference,
             self._compat_policy_dir_ctx,
-        ) = _load_policy(policy_dir, device_name)
+        ) = _load_policy(
+            policy_dir,
+            device_name,
+            disable_action_delta_refiner=disable_action_delta_refiner,
+        )
         self.expected_state_shape = _feature_shape_dim(self.config.input_features.get("observation.state"))
         self.expected_action_shape = _feature_shape_dim(self.config.output_features.get("action"))
         self.expected_front_image_shape = _feature_shape_dim(
             self.config.input_features.get("observation.images.front")
         )
         self.stretch_image_to_policy_shape = bool(stretch_image_to_policy_shape)
+        self.disable_action_delta_refiner = bool(disable_action_delta_refiner)
         self.http_image_transform = _load_server_image_transform(policy_dir)
         # [interface conversion] Raw HumanoidArena checkpoints were trained on
         # the literal dataset task string.  Keep an explicit mode that prevents
@@ -553,6 +605,14 @@ class LeRobotServerState:
             "[lerobot_vla_server] precision policy type={} config_dtype={} use_amp={} amp={}".format(
                 config_type, config_dtype, self._use_amp, amp_label
             ),
+            flush=True,
+        )
+        print(
+            "[lerobot_vla_server] action delta refiner "
+            f"checkpoint_enabled={bool(getattr(self.config, 'action_delta_refiner_enabled', False))} "
+            f"runtime_enabled={bool(getattr(self.config, 'action_delta_refiner_enabled', False)) and not self.disable_action_delta_refiner} "
+            f"base_hz={getattr(self.config, 'base_action_frequency_hz', None)} "
+            f"refiner_hz={getattr(self.config, 'action_delta_refiner_frequency_hz', None)}",
             flush=True,
         )
         self.lock = threading.Lock()
@@ -1049,6 +1109,11 @@ def main():
         action="store_true",
         help="Resize the HTTP image directly to the checkpoint CHW shape without aspect padding.",
     )
+    parser.add_argument(
+        "--disable-action-delta-refiner",
+        action="store_true",
+        help="Disable the Stream action delta refiner and run the base Action Expert only.",
+    )
     args = parser.parse_args()
 
     if args.lerobot_src:
@@ -1077,6 +1142,7 @@ def main():
             args.device,
             verbatim_task=args.verbatim_task,
             stretch_image_to_policy_shape=args.stretch_image_to_policy_shape,
+            disable_action_delta_refiner=args.disable_action_delta_refiner,
         )
         server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 

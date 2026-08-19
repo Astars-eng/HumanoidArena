@@ -64,6 +64,10 @@ SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onn
 
 SERVER_PYTHON="${SERVER_PYTHON:-python}"
 SERVER_SCRIPT="${SERVER_SCRIPT:-${ISAACLAB_ROOT}/../lerobot/scripts/serve_lerobot_vla_http.py}"
+SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-}"
+SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-}"
+SERVER_VERBATIM_TASK="${SERVER_VERBATIM_TASK:-1}"
+SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE="${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE:-1}"
 SERVER_GPU_IDS="${SERVER_GPU_IDS:-0,1,2,3,4,5,6,7}"
 # SERVER_GPU_IDS="${SERVER_GPU_IDS:-7}"
 SERVER_DEVICE="${SERVER_DEVICE:-cuda:0}"
@@ -203,10 +207,13 @@ ARGS=(
   --sonic_decoder_path "${SONIC_DECODER_PATH}"
   --sonic_vla_root_rot6d_layout "${SONIC_VLA_ROOT_ROT6D_LAYOUT}"
   --sonic_vla_root_max_delta_deg "${SONIC_VLA_ROOT_MAX_DELTA_DEG}"
+  --sonic_vla_action_format "${SONIC_VLA_ACTION_FORMAT:-raw107}"
+  --sonic_raw107_body_source "${SONIC_RAW107_BODY_SOURCE:-native_decoder}"
   --results_dir "${RESULTS_DIR}"
   --isaac_device "${ISAAC_DEVICE}"
   --server_python "${SERVER_PYTHON}"
   --server_script "${SERVER_SCRIPT}"
+  --server_lerobot_src "${SERVER_LEROBOT_SRC}"
   --server_device "${SERVER_DEVICE}"
   --server_gpu_ids "${SERVER_GPU_IDS}"
   --server_host "${SERVER_HOST}"
@@ -215,6 +222,16 @@ ARGS=(
   --lerobot_server_timeout "${LEROBOT_SERVER_TIMEOUT}"
   --persistent_sim "${PERSISTENT_SIM}"
 )
+
+if [[ -n "${SERVER_CHECKPOINT_REF_REMAP}" ]]; then
+  ARGS+=(--server_checkpoint_ref_remap "${SERVER_CHECKPOINT_REF_REMAP}")
+fi
+if [[ "${SERVER_VERBATIM_TASK}" == "1" ]]; then
+  ARGS+=(--server_verbatim_task)
+fi
+if [[ "${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE}" == "1" ]]; then
+  ARGS+=(--server_stretch_image_to_policy_shape)
+fi
 
 if [[ "${HEADLESS}" == "1" ]]; then
   ARGS+=(--headless)

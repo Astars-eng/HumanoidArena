@@ -15,6 +15,8 @@ from pathlib import Path
 ISAACLAB_ROOT = Path(__file__).resolve().parents[3]
 PROJECT_ROOT = str(ISAACLAB_ROOT)
 os.environ["PROJECT_ROOT"] = PROJECT_ROOT
+os.environ["SONIC_VLA_ACTION_FORMAT"] = "semantic_v3"
+os.environ["SONIC_VLA_STATE_FORMAT"] = "raw64"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -190,7 +192,8 @@ def _normalize_control_routing(args):
     args.action_source = "sonic_wholebody"
     args.enable_wholebody_dds = True
     args.enable_dex1_dds = False
-    args.enable_dex3_dds = True
+    args.enable_dex3_dds = False
+    args.enable_dex3_model_control = True
     args.enable_inspire_dds = False
     args.replay_file = ""
     args.replay_mode = "inference_replay"
@@ -646,6 +649,11 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "act_refpose_history_steps": int(args_cli.act_refpose_history_steps),
         "act_refpose_execute_steps": int(args_cli.act_refpose_execute_steps),
         "act_refpose_record_full_chunks": bool(args_cli.act_refpose_record_full_chunks),
+        "act_refpose_input_contract": "joint_pos29+joint_vel29+ang_vel_b3+gravity3",
+        "act_refpose_history_order": "t-9_to_t",
+        "act_refpose_predicted_chunk_steps": 25,
+        "act_refpose_action_dim": 52,
+        "act_refpose_hand_contract": "continuous_left7+right7",
     }
     if error:
         payload["error"] = error

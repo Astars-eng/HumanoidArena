@@ -7,7 +7,7 @@ ISAACLAB_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${ISAACLAB_ROOT}/script/common/runtime_paths.sh"
 export ROBOT_USD_OVERRIDE="${ISAACLAB_ROOT}/assets/robots/g1-29dof_wholebody_dex3/g1_29dof_with_dex3_rev_1_0_m2.usd"
 ENV_CONFIG_YAML="${ENV_CONFIG_YAML:-tasks/common_env_config/doubledesk_sonic.yaml}"
-ISAAC_DEVICE="${ISAAC_DEVICE:-cpu}"
+ISAAC_DEVICE="${ISAAC_DEVICE:-cuda:0}"
 HEADLESS="${HEADLESS:-1}"
 MAX_STEPS="${MAX_STEPS:-1000}"
 VIDEO_FPS="${VIDEO_FPS:-30}"
@@ -23,25 +23,21 @@ ACT_REFPOSE_RECORD_FULL_CHUNKS="${ACT_REFPOSE_RECORD_FULL_CHUNKS:-1}"
 SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onnx}"
 SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
 
-DEFAULT_SERVER_PYTHON="python"
-if [[ -x "/home/user/anaconda3/envs/lerobot/bin/python" ]]; then
-  DEFAULT_SERVER_PYTHON="/home/user/anaconda3/envs/lerobot/bin/python"
-fi
-SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
+SERVER_PYTHON="${SERVER_PYTHON:-python}"
 SERVER_SCRIPT="${SCRIPT_DIR}/serve_act_refpose_vla_http.py"
 SERVER_DEVICE="cuda:0"
 SERVER_HOST="127.0.0.1"
-SERVER_PORT=8443
+SERVER_PORT="${SERVER_PORT:-8443}"
 SERVER_SCHEME="http"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1800}"
-LEROBOT_SERVER_TIMEOUT=5.0
+LEROBOT_SERVER_TIMEOUT="${LEROBOT_SERVER_TIMEOUT:-360.0}"
 LEROBOT_VERIFY_SSL=0
 TLS_CERT_FILE=""
 TLS_KEY_FILE=""
 
 REPEATS_PER_SEED="${REPEATS_PER_SEED:-1}"
-if [[ -z "${LEROBOT_VLA_SRC:-}" && -d "${ISAACLAB_ROOT}/../../fym/vla/src" ]]; then
-  export LEROBOT_VLA_SRC="$(cd "${ISAACLAB_ROOT}/../../fym/vla/src" && pwd)"
+if [[ -z "${LEROBOT_VLA_SRC:-}" && -d "${ISAACLAB_ROOT}/../../vla/src" ]]; then
+  export LEROBOT_VLA_SRC="$(cd "${ISAACLAB_ROOT}/../../vla/src" && pwd)"
 fi
 if [[ -n "${EVAL_SEEDS:-}" ]]; then
   read -r -a SEEDS <<< "${EVAL_SEEDS}"
@@ -89,7 +85,19 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
 fi
 MODEL_PATHS=("${MODEL_PATH}")
 
+for runtime_file in "${SONIC_ENCODER_PATH}" "${SONIC_DECODER_PATH}"; do
+  if [[ ! -f "${runtime_file}" ]]; then
+    echo "[run_vla_eval] required SONIC runtime model is missing: ${runtime_file}" >&2
+    exit 2
+  fi
+done
+"${ISAACLAB_PYTHON}" -c 'import numpy as np; major=int(np.__version__.split(".",1)[0]); assert major < 2, f"Isaac Sim requires NumPy 1.x, got {np.__version__}"'
+"${SERVER_PYTHON}" "${SCRIPT_DIR}/refpose52_contract.py" "${MODEL_PATH}"
+
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/eval_results/single_$(date +%Y%m%d_%H%M%S)}"
+echo "IsaacLab Python: ${ISAACLAB_PYTHON}"
+echo "LeRobot server Python: ${SERVER_PYTHON}"
+echo "ACT RefPose contract: input=10x64 image=3x224x224 output=25x52 execute=${ACT_REFPOSE_EXECUTE_STEPS}"
 
 ARGS=(
   --task "${TASK_NAME}"

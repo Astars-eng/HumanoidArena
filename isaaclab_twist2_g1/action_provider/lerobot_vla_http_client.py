@@ -21,6 +21,41 @@ class LeRobotVLAHttpClient:
         self.verify_ssl = bool(verify_ssl)
         self._trace_path = os.environ.get("LEROBOT_VLA_TRACE_PATH", "").strip()
         self._trace_step_idx = 0
+        self._last_hand_actions: dict[str, np.ndarray] = {}
+        self._last_hand_action_chunk: dict[str, np.ndarray] = {}
+
+    @staticmethod
+    def _parse_hand_actions(
+        response: dict[str, Any],
+        field: str,
+        *,
+        expected_ndim: int,
+    ) -> dict[str, np.ndarray]:
+        payload = response.get(field)
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Expected {field} to be an object, got {type(payload).__name__}")
+
+        parsed: dict[str, np.ndarray] = {}
+        for key, values in payload.items():
+            array = np.asarray(values, dtype=np.float32)
+            if array.ndim != expected_ndim:
+                raise RuntimeError(
+                    f"Expected {field}[{key!r}] rank {expected_ndim}, got shape {array.shape}"
+                )
+            if not np.isfinite(array).all():
+                raise RuntimeError(f"{field}[{key!r}] contains NaN or Inf")
+            parsed[str(key)] = np.ascontiguousarray(array)
+        return parsed
+
+    def get_last_hand_actions(self) -> dict[str, np.ndarray]:
+        """Return the optional hand targets aligned with the latest single action."""
+        return {key: value.copy() for key, value in self._last_hand_actions.items()}
+
+    def get_last_hand_action_chunk(self) -> dict[str, np.ndarray]:
+        """Return the optional hand chunks aligned with the latest body chunk."""
+        return {key: value.copy() for key, value in self._last_hand_action_chunk.items()}
 
     def _append_trace(self, payload: dict[str, Any]) -> None:
         if not self._trace_path:
@@ -98,6 +133,22 @@ class LeRobotVLAHttpClient:
         if task_name:
             payload["task"] = task_name
         response = self._post_json("/infer", payload)
+        self._last_hand_action_chunk = self._parse_hand_actions(
+            response,
+            "hand_action_chunk",
+            expected_ndim=2,
+        )
+        self._last_hand_actions = self._parse_hand_actions(
+            response,
+            "hand_actions",
+            expected_ndim=1,
+        )
+        if not self._last_hand_actions and self._last_hand_action_chunk:
+            self._last_hand_actions = {
+                key: values[0].copy()
+                for key, values in self._last_hand_action_chunk.items()
+                if values.shape[0] > 0
+            }
         action_chunk = response.get("action_chunk")
         if action_chunk is None:
             action_chunk = response.get("latent64_chunk")
@@ -131,6 +182,9 @@ class LeRobotVLAHttpClient:
                 "observation_state": state.tolist(),
                 "chunk_size": int(action_chunk.shape[0]),
                 "first_action": action_chunk[0].tolist() if action_chunk.size > 0 else [],
+                "hand_actions": {
+                    key: value.tolist() for key, value in self._last_hand_actions.items()
+                },
             }
         )
         self._trace_step_idx += 1
@@ -176,6 +230,12 @@ class LeRobotVLAHttpClient:
         if task_name:
             payload["task"] = task_name
         response = self._post_json("/infer", payload)
+        self._last_hand_action_chunk = {}
+        self._last_hand_actions = self._parse_hand_actions(
+            response,
+            "hand_actions",
+            expected_ndim=1,
+        )
         if "action" not in response:
             raise RuntimeError("Expected action in single-action server response")
         action = np.asarray(response["action"], dtype=np.float32).reshape(-1)
@@ -189,6 +249,9 @@ class LeRobotVLAHttpClient:
                 "front_rgb_shape": list(rgb.shape),
                 "observation_state": state.tolist(),
                 "action": action.tolist(),
+                "hand_actions": {
+                    key: value.tolist() for key, value in self._last_hand_actions.items()
+                },
             }
         )
         self._trace_step_idx += 1
@@ -214,6 +277,8 @@ class LeRobotVLAHttpClient:
         if seed is not None:
             payload["seed"] = int(seed)
         self._post_json("/reset", payload)
+        self._last_hand_actions = {}
+        self._last_hand_action_chunk = {}
         self._append_trace(
             {
                 "event": "reset",

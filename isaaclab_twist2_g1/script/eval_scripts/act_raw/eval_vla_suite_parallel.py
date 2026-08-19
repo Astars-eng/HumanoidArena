@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from eval_vla_suite import (
-    TASK_FOOTBALL_SINGLE,
+    TASK_DOUBLE_DESK,
     _derive_episode_seed,
     _result_key,
     _run_episode,
@@ -380,7 +380,7 @@ def _worker_run(task_spec: dict, args_dict: dict, run_dir_str: str) -> list[dict
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Parallel football-single VLA evaluation suite')
-    parser.add_argument('--task', type=str, default=TASK_FOOTBALL_SINGLE)
+    parser.add_argument('--task', type=str, default=TASK_DOUBLE_DESK)
     parser.add_argument('--env_config_yaml', type=str, default='tasks/common_test_config/base_test/football_single_sonic_test.yaml')
     parser.add_argument('--model-path', dest='model_paths', action='append', required=True)
     parser.add_argument('--seed', dest='seeds', action='append', type=int, required=True)
@@ -407,6 +407,13 @@ def main() -> int:
         default=26.0,
         help="Clamp max root orientation delta per step (degrees). <=0 to disable.",
     )
+    parser.add_argument('--sonic_vla_action_format', type=str, default='raw107', choices=['raw107'])
+    parser.add_argument(
+        '--sonic_raw107_body_source',
+        type=str,
+        default='native_decoder',
+        choices=['native_decoder', 'direct_raw'],
+    )
     parser.add_argument('--results_dir', type=str, required=True)
     parser.add_argument('--headless', action='store_true', default=False)
     parser.add_argument('--isaac_device', type=str, default='cpu')
@@ -414,6 +421,10 @@ def main() -> int:
     parser.add_argument('--server_script', type=str, required=True)
     parser.add_argument('--server_device', type=str, default='cuda:0')
     parser.add_argument('--server_gpu_ids', type=str, default='')
+    parser.add_argument('--server_lerobot_src', type=str, default='')
+    parser.add_argument('--server_checkpoint_ref_remap', action='append', default=[])
+    parser.add_argument('--server_verbatim_task', action='store_true', default=False)
+    parser.add_argument('--server_stretch_image_to_policy_shape', action='store_true', default=False)
     parser.add_argument('--server_host', type=str, default='127.0.0.1')
     parser.add_argument('--server_scheme', type=str, default='http', choices=['http', 'https'])
     parser.add_argument('--tls_cert_file', type=str, default='')
