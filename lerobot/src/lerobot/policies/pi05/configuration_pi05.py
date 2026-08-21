@@ -68,6 +68,7 @@ class PI05Config(PreTrainedConfig):
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
 
+    tokenizer_name: str = "google/paligemma-3b-pt-224"
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -87,6 +88,10 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # Allow loading a base checkpoint whose padded action dimension differs from
+    # max_action_dim. Only the action input/output projections are resized; all
+    # other pretrained tensors must still match exactly.
+    adapt_action_head_from_pretrained: bool = False
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -101,8 +106,6 @@ class PI05Config(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
-
-    tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     def __post_init__(self):
         super().__post_init__()

@@ -263,6 +263,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             "the checkpoint processors do not define them. Building processors from current policy config."
         )
         processor_pretrained_path = None
+    if (
+        getattr(cfg.policy, "adapt_action_head_from_pretrained", False)
+        and processor_pretrained_path is not None
+        and not cfg.resume
+    ):
+        logging.warning(
+            "adapt_action_head_from_pretrained=true: building processors from the current PI0.5 config "
+            "so tokenizer and action dimensions match the target dataset."
+        )
+        processor_pretrained_path = None
 
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}

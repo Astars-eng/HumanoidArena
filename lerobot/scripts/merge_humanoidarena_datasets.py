@@ -32,6 +32,23 @@ DEFAULT_OUTPUT_BASE = Path(
 )
 DEFAULT_REPO_PREFIX = "local"
 
+DERIVED_VECTOR_FEATURES: dict[str, tuple[str, ...]] = {
+    "observation.state": (
+        "observation.joint_pos",
+        "observation.joint_vel",
+        "observation.ang_vel_b",
+        "observation.gravity",
+        "observation.last_action",
+    ),
+    "action": (
+        "action.applied_action",
+        "action.motion_token",
+        "action.left_hand",
+        "action.right_hand",
+    ),
+}
+STAT_NAMES = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+
 
 @dataclass(frozen=True)
 class SourceDataset:
@@ -256,6 +273,131 @@ def validate_compatible_sources(sources: list[SourceDataset]) -> None:
         if source.info["codebase_version"] != codebase_ref:
             raise ValueError(f"codebase_version mismatch: {source.path} differs from {first.path}")
 
+    build_derived_feature_specs(feature_ref)
+
+
+def build_derived_feature_specs(features: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    specs: dict[str, dict[str, Any]] = {}
+    for output_key, source_keys in DERIVED_VECTOR_FEATURES.items():
+        output_names: list[str] = []
+        output_dim = 0
+        for source_key in source_keys:
+            if source_key not in features:
+                raise ValueError(f"Cannot build {output_key!r}: source feature {source_key!r} is missing")
+            source_feature = features[source_key]
+            if source_feature.get("dtype") != "float32":
+                raise ValueError(
+                    f"Cannot build {output_key!r}: {source_key!r} must have dtype='float32', "
+                    f"got {source_feature.get('dtype')!r}"
+                )
+            shape = source_feature.get("shape")
+            if not isinstance(shape, (list, tuple)) or len(shape) != 1 or not isinstance(shape[0], int):
+                raise ValueError(
+                    f"Cannot build {output_key!r}: {source_key!r} must be a 1-D vector, got shape={shape!r}"
+                )
+            source_dim = int(shape[0])
+            source_names = source_feature.get("names")
+            if source_names is not None and len(source_names) != source_dim:
+                raise ValueError(
+                    f"Cannot build {output_key!r}: {source_key!r} has {len(source_names)} names "
+                    f"for dimension {source_dim}"
+                )
+            output_names.extend(
+                f"{source_key}:{source_names[index] if source_names is not None else index}"
+                for index in range(source_dim)
+            )
+            output_dim += source_dim
+
+        spec = {"dtype": "float32", "shape": [output_dim], "names": output_names}
+        existing = features.get(output_key)
+        existing_matches = existing is not None and (
+            existing.get("dtype") == spec["dtype"]
+            and list(existing.get("shape", [])) == spec["shape"]
+            and list(existing.get("names", [])) == spec["names"]
+        )
+        if existing is not None and not existing_matches:
+            raise ValueError(
+                f"Existing derived feature {output_key!r} does not match the expected concatenation: "
+                f"expected={spec!r}, got={existing!r}"
+            )
+        specs[output_key] = spec
+    return specs
+
+
+def concatenate_vector_columns(
+    df: pd.DataFrame,
+    output_key: str,
+    source_keys: tuple[str, ...],
+    expected_dim: int,
+) -> np.ndarray:
+    arrays: list[np.ndarray] = []
+    for source_key in source_keys:
+        if source_key not in df:
+            raise ValueError(f"Cannot build {output_key!r}: parquet column {source_key!r} is missing")
+        try:
+            array = np.stack(df[source_key].to_numpy()).astype(np.float32, copy=False)
+        except ValueError as exc:
+            raise ValueError(f"Cannot stack parquet column {source_key!r} for {output_key!r}") from exc
+        if array.ndim != 2:
+            raise ValueError(
+                f"Cannot build {output_key!r}: parquet column {source_key!r} must be 2-D after stacking, "
+                f"got shape={array.shape}"
+            )
+        arrays.append(array)
+
+    result = np.concatenate(arrays, axis=1)
+    if result.shape[1] != expected_dim:
+        raise ValueError(
+            f"Derived parquet column {output_key!r} has dimension {result.shape[1]}, expected {expected_dim}"
+        )
+    return np.ascontiguousarray(result, dtype=np.float32)
+
+
+def concatenate_stats(
+    stats: dict[str, dict[str, np.ndarray]],
+    output_key: str,
+    source_keys: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    combined: dict[str, np.ndarray] = {}
+    for stat_name in STAT_NAMES:
+        values: list[np.ndarray] = []
+        for source_key in source_keys:
+            feature_stats = stats.get(source_key)
+            if feature_stats is None or stat_name not in feature_stats:
+                raise ValueError(f"Cannot build stats for {output_key!r}: missing {source_key!r}/{stat_name}")
+            values.append(np.asarray(feature_stats[stat_name]))
+
+        if stat_name == "count":
+            if any(not np.array_equal(values[0], value) for value in values[1:]):
+                raise ValueError(f"Cannot build stats for {output_key!r}: source feature counts differ")
+            combined[stat_name] = values[0].copy()
+        else:
+            combined[stat_name] = np.concatenate(values)
+    return combined
+
+
+def add_derived_episode_stats(ep_df: pd.DataFrame) -> None:
+    for output_key, source_keys in DERIVED_VECTOR_FEATURES.items():
+        for stat_name in STAT_NAMES:
+            source_columns = [f"stats/{source_key}/{stat_name}" for source_key in source_keys]
+            missing = [column for column in source_columns if column not in ep_df]
+            if missing:
+                raise ValueError(f"Cannot build episode stats for {output_key!r}: missing columns {missing}")
+
+            values: list[np.ndarray] = []
+            for row_index in range(len(ep_df)):
+                row_values = [np.asarray(ep_df.iloc[row_index][column]) for column in source_columns]
+                if stat_name == "count":
+                    if any(not np.array_equal(row_values[0], value) for value in row_values[1:]):
+                        raise ValueError(
+                            f"Cannot build episode stats for {output_key!r}: source counts differ "
+                            f"at row {row_index}"
+                        )
+                    values.append(row_values[0].copy())
+                else:
+                    values.append(np.concatenate(row_values))
+            ep_df[f"stats/{output_key}/{stat_name}"] = values
+
 
 def build_global_tasks(sources: list[SourceDataset]) -> tuple[pd.DataFrame, list[dict[int, int]]]:
     task_to_global: OrderedDict[str, int] = OrderedDict()
@@ -327,6 +469,9 @@ def update_stats(
         if chunks:
             merged_stats[key] = scalar_stats(np.concatenate(chunks))
 
+    for output_key, source_keys in DERIVED_VECTOR_FEATURES.items():
+        merged_stats[output_key] = concatenate_stats(merged_stats, output_key, source_keys)
+
     write_stats(merged_stats, output_root)
 
 
@@ -359,6 +504,8 @@ def merge_datasets(
     task_df, source_task_maps = build_global_tasks(sources)
 
     first_info = json.loads(json.dumps(sources[0].info))
+    derived_feature_specs = build_derived_feature_specs(first_info["features"])
+    first_info["features"].update(derived_feature_specs)
     chunk_size = int(first_info.get("chunks_size", 1000))
     video_keys = [
         key for key, feature in first_info["features"].items() if feature.get("dtype") == "video"
@@ -401,6 +548,15 @@ def merge_datasets(
                 raise ValueError(f"Missing task_index mapping for {source.path}: {missing}")
             df["task_index"] = mapped_task_index.astype("int64")
 
+            for output_key, source_keys in DERIVED_VECTOR_FEATURES.items():
+                derived_values = concatenate_vector_columns(
+                    df,
+                    output_key,
+                    source_keys,
+                    int(derived_feature_specs[output_key]["shape"][0]),
+                )
+                df[output_key] = list(derived_values)
+
             for key in scalar_columns:
                 scalar_columns[key].append(df[key].to_numpy(copy=True))
 
@@ -429,6 +585,7 @@ def merge_datasets(
         ep_df["episode_index"] = ep_df["episode_index"].astype("int64") + episode_offset
         ep_df["dataset_from_index"] = ep_df["dataset_from_index"].astype("int64") + frame_offset
         ep_df["dataset_to_index"] = ep_df["dataset_to_index"].astype("int64") + frame_offset
+        add_derived_episode_stats(ep_df)
 
         for idx, row in ep_df.iterrows():
             src_key = (int(row["data/chunk_index"]), int(row["data/file_index"]))
@@ -481,6 +638,13 @@ def merge_datasets(
         "total_tasks": len(task_df),
         "total_episodes": int(episode_offset),
         "total_frames": int(frame_offset),
+        "derived_features": {
+            output_key: {
+                "source_keys": list(DERIVED_VECTOR_FEATURES[output_key]),
+                **derived_feature_specs[output_key],
+            }
+            for output_key in DERIVED_VECTOR_FEATURES
+        },
         "sources": manifest_sources,
         "tasks": [
             {"task_index": int(row["task_index"]), "task": str(task)}
@@ -494,6 +658,7 @@ def merge_datasets(
 
 def print_plan(sources: list[SourceDataset], output_root: Path, repo_id: str, video_mode: str) -> None:
     task_df, _ = build_global_tasks(sources)
+    derived_feature_specs = build_derived_feature_specs(sources[0].info["features"])
     total_episodes = sum(int(source.info["total_episodes"]) for source in sources)
     total_frames = sum(int(source.info["total_frames"]) for source in sources)
     print(f"selected datasets : {len(sources)}")
@@ -503,6 +668,10 @@ def print_plan(sources: list[SourceDataset], output_root: Path, repo_id: str, vi
     print(f"output root       : {output_root}")
     print(f"repo id           : {repo_id}")
     print(f"video mode        : {video_mode}")
+    print(
+        "derived features  : "
+        + ", ".join(f"{key}[{spec['shape'][0]}]" for key, spec in derived_feature_specs.items())
+    )
     print("")
     for source in sources:
         task_names = [str(task) for task in source.tasks.sort_values("task_index").index]

@@ -64,6 +64,68 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+_ACTION_HEAD_ADAPTATION_KEYS = {
+    "model.action_in_proj.weight",
+    "model.action_out_proj.weight",
+    "model.action_out_proj.bias",
+}
+
+
+def _adapt_pi05_action_head_state_dict(
+    pretrained_state_dict: dict[str, Tensor],
+    target_state_dict: dict[str, Tensor],
+) -> tuple[dict[str, Tensor], list[str]]:
+    """Resize only PI0.5 action projections while preserving overlapping base weights.
+
+    Newly introduced action dimensions keep the target module's normal PyTorch
+    initialization. A mismatch in any non-action-head tensor is rejected so a
+    checkpoint cannot silently degrade into a partially random model.
+    """
+    adapted_state_dict = dict(pretrained_state_dict)
+    adapted_keys: list[str] = []
+
+    for key, source in pretrained_state_dict.items():
+        target = target_state_dict.get(key)
+        if target is None or source.shape == target.shape:
+            continue
+        if key not in _ACTION_HEAD_ADAPTATION_KEYS:
+            raise RuntimeError(
+                f"Unsupported PI0.5 pretrained tensor shape mismatch for {key}: "
+                f"checkpoint={tuple(source.shape)} target={tuple(target.shape)}"
+            )
+
+        adapted = target.detach().clone()
+        source = source.to(device=adapted.device, dtype=adapted.dtype)
+        if key == "model.action_in_proj.weight":
+            if source.ndim != 2 or adapted.ndim != 2 or source.shape[0] != adapted.shape[0]:
+                raise RuntimeError(
+                    f"Cannot adapt {key}: checkpoint={tuple(source.shape)} target={tuple(adapted.shape)}"
+                )
+            overlap = min(source.shape[1], adapted.shape[1])
+            adapted[:, :overlap].copy_(source[:, :overlap])
+        elif key == "model.action_out_proj.weight":
+            if source.ndim != 2 or adapted.ndim != 2 or source.shape[1] != adapted.shape[1]:
+                raise RuntimeError(
+                    f"Cannot adapt {key}: checkpoint={tuple(source.shape)} target={tuple(adapted.shape)}"
+                )
+            overlap = min(source.shape[0], adapted.shape[0])
+            adapted[:overlap, :].copy_(source[:overlap, :])
+        else:
+            if source.ndim != 1 or adapted.ndim != 1:
+                raise RuntimeError(
+                    f"Cannot adapt {key}: checkpoint={tuple(source.shape)} target={tuple(adapted.shape)}"
+                )
+            overlap = min(source.shape[0], adapted.shape[0])
+            adapted[:overlap].copy_(source[:overlap])
+
+        adapted_state_dict[key] = adapted
+        adapted_keys.append(
+            f"{key}: checkpoint={tuple(source.shape)} -> target={tuple(adapted.shape)}, overlap={overlap}"
+        )
+
+    return adapted_state_dict, adapted_keys
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -976,31 +1038,29 @@ class PI05Policy(PreTrainedPolicy):
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
 
-        # Load state dict (expects keys with "model." prefix)
+        # Load state dict (expects keys with "model." prefix).
         try:
             print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+            from transformers.utils import cached_file
 
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
+            resolved_file = cached_file(
+                pretrained_name_or_path,
+                "model.safetensors",
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                revision=revision,
+                local_files_only=local_files_only,
+            )
+            if resolved_file is None:
+                raise FileNotFoundError(f"model.safetensors not found in {pretrained_name_or_path}")
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+            from safetensors.torch import load_file
+
+            original_state_dict = load_file(resolved_file)
+            print("✓ Loaded state dict from model.safetensors")
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1019,6 +1079,30 @@ class PI05Policy(PreTrainedPolicy):
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
+
+            target_state_dict = model.state_dict()
+            shape_mismatches = {
+                key: (tuple(value.shape), tuple(target_state_dict[key].shape))
+                for key, value in remapped_state_dict.items()
+                if key in target_state_dict and value.shape != target_state_dict[key].shape
+            }
+            if shape_mismatches:
+                if not getattr(config, "adapt_action_head_from_pretrained", False):
+                    details = ", ".join(
+                        f"{key}: checkpoint={source_shape} target={target_shape}"
+                        for key, (source_shape, target_shape) in shape_mismatches.items()
+                    )
+                    raise RuntimeError(
+                        "PI0.5 checkpoint tensor shapes do not match the requested architecture. "
+                        "Set policy.adapt_action_head_from_pretrained=true only when the listed mismatches "
+                        f"are action projections. Mismatches: {details}"
+                    )
+                remapped_state_dict, adapted_keys = _adapt_pi05_action_head_state_dict(
+                    remapped_state_dict,
+                    target_state_dict,
+                )
+                for message in adapted_keys:
+                    logging.warning("Adapted PI0.5 pretrained action head: %s", message)
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
@@ -1046,8 +1130,10 @@ class PI05Policy(PreTrainedPolicy):
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
 
-        except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load PI0.5 pretrained weights from {pretrained_name_or_path}"
+            ) from exc
 
         return model
 
