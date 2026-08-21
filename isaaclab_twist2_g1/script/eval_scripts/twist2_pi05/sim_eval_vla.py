@@ -406,8 +406,8 @@ def _finalize_video(recorder, target_dir: Path, episode_name: str, suffix: str) 
     final_path = target_dir / f"{episode_name}__{suffix}.mp4"
     has_frames = bool(getattr(recorder, 'frame_count', 0) > 0 or getattr(recorder, 'frames', None))
     if has_frames:
-        recorder.save(output_path=final_path)
-        return str(final_path)
+        saved_path = recorder.save(output_path=final_path)
+        return str(saved_path or final_path)
     return ""
 
 

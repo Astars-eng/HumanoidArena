@@ -17,6 +17,11 @@ CONDA_BASE="${CONDA_BASE:-}"
 ISAACLAB_CONDA_ENV_NAME="${ISAACLAB_CONDA_ENV_NAME:-unitree_sim_env}"
 LEROBOT_CONDA_ENV_NAME="${LEROBOT_CONDA_ENV_NAME:-lerobot}"
 
+# Episode videos are finalized as browser-compatible H.264 by default. Set
+# VIDEO_H264=0 in a run_vla_eval entry point to keep mp4v output.
+VIDEO_H264="${VIDEO_H264:-${HUMANOIDARENA_EVAL_VIDEO_H264:-1}}"
+HUMANOIDARENA_EVAL_VIDEO_H264="${VIDEO_H264}"
+
 conda_base_has_required_envs() {
   local base="$1"
   [[ -n "${base}" ]] || return 1
@@ -73,3 +78,4 @@ SERVER_PYTHON="${SERVER_PYTHON:-python}"
 
 export ISAACLAB_ROOT HUMANOIDARENA_ROOT TWIST2_ROOT LEROBOT_ROOT GROOT_ROOT SONIC_POLICY_ROOT
 export CONDA_BASE ISAACLAB_PYTHON SERVER_PYTHON
+export VIDEO_H264 HUMANOIDARENA_EVAL_VIDEO_H264
