@@ -7,11 +7,290 @@ Records and combines:
 - SMPL visualization
 """
 
+import json
 import os
-import numpy as np
+import shutil
+import subprocess
+import tempfile
+from fractions import Fraction
 from pathlib import Path
-import cv2
 from typing import Optional
+
+import cv2
+import numpy as np
+
+
+class VideoTranscodeError(RuntimeError):
+    """Raised when a recorded video cannot be safely converted to H.264."""
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_rate(value: object) -> float:
+    if value in (None, "", "0/0"):
+        return 0.0
+    try:
+        return float(Fraction(str(value)))
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _parse_number(value: object) -> Optional[float]:
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_video_program(name: str, env_name: str) -> str:
+    configured = os.getenv(env_name, "").strip()
+    resolved = configured or shutil.which(name)
+    if not resolved:
+        raise VideoTranscodeError(
+            f"{name} was not found; set {env_name} to an executable path"
+        )
+    return resolved
+
+
+def _run_video_program(args: list[str], *, timeout: float, operation: str) -> subprocess.CompletedProcess:
+    try:
+        completed = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise VideoTranscodeError(f"{operation} failed: {exc}") from exc
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        if len(details) > 4000:
+            details = details[-4000:]
+        raise VideoTranscodeError(
+            f"{operation} exited with code {completed.returncode}"
+            + (f": {details}" if details else "")
+        )
+    return completed
+
+
+def _probe_video(video_path: Path, ffprobe_path: str) -> dict:
+    completed = _run_video_program(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-threads",
+            "1",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            (
+                "stream=codec_name,codec_tag_string,pix_fmt,width,height,"
+                "r_frame_rate,avg_frame_rate,nb_frames,nb_read_frames,duration:"
+                "format=duration"
+            ),
+            "-of",
+            "json",
+            str(video_path),
+        ],
+        timeout=120.0,
+        operation=f"probing {video_path}",
+    )
+    try:
+        payload = json.loads(completed.stdout)
+        stream = payload["streams"][0]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise VideoTranscodeError(f"No readable video stream found in {video_path}") from exc
+
+    duration = _parse_number(stream.get("duration"))
+    if duration is None:
+        duration = _parse_number(payload.get("format", {}).get("duration"))
+    frame_count = _parse_number(stream.get("nb_read_frames"))
+    if frame_count is None:
+        frame_count = _parse_number(stream.get("nb_frames"))
+    fps = _parse_rate(stream.get("avg_frame_rate")) or _parse_rate(stream.get("r_frame_rate"))
+    return {
+        "codec_name": stream.get("codec_name", ""),
+        "codec_tag_string": stream.get("codec_tag_string", ""),
+        "pix_fmt": stream.get("pix_fmt", ""),
+        "width": int(stream.get("width", 0)),
+        "height": int(stream.get("height", 0)),
+        "fps": fps,
+        "frame_count": int(frame_count) if frame_count is not None else None,
+        "duration": duration,
+    }
+
+
+def _verify_h264_video(source_info: dict, output_path: Path, ffmpeg_path: str, ffprobe_path: str) -> None:
+    output_info = _probe_video(output_path, ffprobe_path)
+    problems = []
+    if output_info["codec_name"] != "h264":
+        problems.append(f"codec={output_info['codec_name']!r}")
+    if output_info["codec_tag_string"] != "avc1":
+        problems.append(f"codec_tag={output_info['codec_tag_string']!r}")
+    if output_info["pix_fmt"] != "yuv420p":
+        problems.append(f"pix_fmt={output_info['pix_fmt']!r}")
+
+    expected_width = source_info["width"] + source_info["width"] % 2
+    expected_height = source_info["height"] + source_info["height"] % 2
+    if (output_info["width"], output_info["height"]) != (expected_width, expected_height):
+        problems.append(
+            f"size={output_info['width']}x{output_info['height']} "
+            f"expected={expected_width}x{expected_height}"
+        )
+
+    source_fps = source_info["fps"]
+    output_fps = output_info["fps"]
+    if source_fps > 0 and (output_fps <= 0 or abs(source_fps - output_fps) > 0.01):
+        problems.append(f"fps={output_fps:g} expected={source_fps:g}")
+
+    source_frames = source_info["frame_count"]
+    output_frames = output_info["frame_count"]
+    if source_frames is not None and output_frames != source_frames:
+        problems.append(f"frames={output_frames} expected={source_frames}")
+
+    source_duration = source_info["duration"]
+    output_duration = output_info["duration"]
+    if source_duration is not None:
+        duration_tolerance = max(0.1, 1.5 / source_fps) if source_fps > 0 else 0.1
+        if output_duration is None or abs(source_duration - output_duration) > duration_tolerance:
+            problems.append(f"duration={output_duration} expected={source_duration}")
+
+    if problems:
+        raise VideoTranscodeError(
+            f"H.264 validation failed for {output_path}: " + ", ".join(problems)
+        )
+
+    duration = output_duration or source_duration or 0.0
+    _run_video_program(
+        [
+            ffmpeg_path,
+            "-v",
+            "error",
+            "-xerror",
+            "-threads",
+            "1",
+            "-i",
+            str(output_path),
+            "-map",
+            "0:v:0",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout=max(120.0, duration * 5.0),
+        operation=f"decoding {output_path}",
+    )
+
+
+def transcode_mp4_to_h264(source_path: str | Path, output_path: str | Path) -> Path:
+    """Convert MP4 to browser-compatible H.264 and delete the source only after validation."""
+    source_path = Path(source_path)
+    output_path = Path(output_path)
+    if not source_path.is_file() or source_path.stat().st_size == 0:
+        raise VideoTranscodeError(f"Source video is missing or empty: {source_path}")
+
+    ffmpeg_path = _find_video_program("ffmpeg", "HUMANOIDARENA_FFMPEG")
+    ffprobe_path = _find_video_program("ffprobe", "HUMANOIDARENA_FFPROBE")
+    source_info = _probe_video(source_path, ffprobe_path)
+    if source_info["width"] <= 0 or source_info["height"] <= 0:
+        raise VideoTranscodeError(f"Source video has invalid dimensions: {source_path}")
+
+    try:
+        crf = int(os.getenv("HUMANOIDARENA_H264_CRF", "20"))
+    except ValueError as exc:
+        raise VideoTranscodeError("HUMANOIDARENA_H264_CRF must be an integer") from exc
+    if not 0 <= crf <= 51:
+        raise VideoTranscodeError("HUMANOIDARENA_H264_CRF must be between 0 and 51")
+    preset = os.getenv("HUMANOIDARENA_H264_PRESET", "veryfast").strip() or "veryfast"
+    try:
+        threads = int(os.getenv("HUMANOIDARENA_H264_THREADS", "2"))
+    except ValueError as exc:
+        raise VideoTranscodeError("HUMANOIDARENA_H264_THREADS must be an integer") from exc
+    if not 1 <= threads <= 64:
+        raise VideoTranscodeError("HUMANOIDARENA_H264_THREADS must be between 1 and 64")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{output_path.stem}.",
+        suffix=".h264.tmp.mp4",
+        dir=output_path.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_handle.name)
+    temp_handle.close()
+    temp_path.unlink()
+
+    try:
+        duration = source_info["duration"] or 0.0
+        _run_video_program(
+            [
+                ffmpeg_path,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-threads",
+                "1",
+                "-i",
+                str(source_path),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                str(crf),
+                "-threads",
+                str(threads),
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(temp_path),
+            ],
+            timeout=max(120.0, duration * 5.0),
+            operation=f"transcoding {source_path} to H.264",
+        )
+        if not temp_path.is_file() or temp_path.stat().st_size == 0:
+            raise VideoTranscodeError(f"H.264 output is missing or empty: {temp_path}")
+        _verify_h264_video(source_info, temp_path, ffmpeg_path, ffprobe_path)
+
+        validated_size = temp_path.stat().st_size
+        os.replace(temp_path, output_path)
+        if not output_path.is_file() or output_path.stat().st_size != validated_size:
+            raise VideoTranscodeError(f"Validated H.264 video was not published correctly: {output_path}")
+
+        if source_path.resolve() != output_path.resolve():
+            try:
+                source_path.unlink()
+            except OSError as exc:
+                print(
+                    f"[video_recorder] H.264 video is valid, but source cleanup failed; "
+                    f"keeping both files: source={source_path} output={output_path} error={exc}"
+                )
+        return output_path
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 class VideoRecorder:
@@ -221,10 +500,15 @@ class SimpleVideoRecorder:
     This avoids holding an entire episode video in RAM during persistent eval.
     """
 
-    def __init__(self, save_path: str, fps: int = 30):
+    def __init__(self, save_path: str, fps: int = 30, transcode_h264: Optional[bool] = None):
         self.save_path = Path(save_path)
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
         self.fps = fps
+        self.transcode_h264 = (
+            _env_flag("HUMANOIDARENA_EVAL_VIDEO_H264", default=True)
+            if transcode_h264 is None
+            else bool(transcode_h264)
+        )
         self.frames = []  # compatibility sentinel for legacy callers
         self.writer = None
         self.frame_count = 0
@@ -236,6 +520,10 @@ class SimpleVideoRecorder:
         if self.writer is None:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self.writer = cv2.VideoWriter(str(self.save_path), fourcc, self.fps, size)
+            if not self.writer.isOpened():
+                self.writer.release()
+                self.writer = None
+                raise RuntimeError(f"Failed to open VideoWriter for: {self.save_path}")
             self._frame_size = size
         elif self._frame_size != size:
             img = cv2.resize(img, self._frame_size)
@@ -251,21 +539,37 @@ class SimpleVideoRecorder:
             self.frames = [True]
         self.frame_count += 1
 
-    def save(self, output_path: Optional[str] = None):
+    def save(self, output_path: Optional[str] = None) -> Optional[Path]:
         """Finalize the writer and optionally move the temp video to a final path."""
         if self.frame_count == 0:
             print("No frames to save!")
-            return
+            return None
         self.close()
         if output_path is not None:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.transcode_h264:
+                source_path = self.save_path
+                try:
+                    self.save_path = transcode_mp4_to_h264(source_path, output_path)
+                    print(
+                        f"[video_recorder] H.264 conversion verified: "
+                        f"{self.save_path} (frames={self.frame_count})"
+                    )
+                    return self.save_path
+                except VideoTranscodeError as exc:
+                    print(
+                        f"[video_recorder] H.264 conversion failed; preserving original video "
+                        f"at {source_path}: {exc}"
+                    )
+                    return source_path
             if output_path != self.save_path:
                 if output_path.exists():
                     output_path.unlink()
                 os.replace(self.save_path, output_path)
                 self.save_path = output_path
         print(f"Video saved: {self.save_path} (frames={self.frame_count})")
+        return self.save_path
 
     def clear(self):
         self.frames = []

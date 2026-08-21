@@ -1495,6 +1495,13 @@ class SonicActionProvider(ActionProvider):
         self.env = env
         self.device = env.device
         self.task_name = getattr(args_cli, "task", "sonic")
+        # Keep the simulator task id for recording/evaluation bookkeeping, and
+        # send the dataset's natural-language task prompt to the policy.
+        self._policy_task = (
+            getattr(args_cli, "policy_task", "")
+            or getattr(args_cli, "language_instruction", "")
+            or self.task_name
+        )
 
         # Debug/perf knobs (默认关闭高频打印，否则会把控制环拖到个位数 Hz)
         # - SONIC_DEBUG=1: 打开详细日志
@@ -1562,15 +1569,16 @@ class SonicActionProvider(ActionProvider):
             getattr(args_cli, "sonic_vla_state_format", os.environ.get("SONIC_VLA_STATE_FORMAT", "rotlocal_v3"))
             or "rotlocal_v3"
         ).strip().lower()
-        if self._vla_state_format not in {"rotlocal_v3", "raw64"}:
+        if self._vla_state_format not in {"rotlocal_v3", "raw64", "raw93"}:
             raise ValueError(
                 f"[SonicActionProvider] Unsupported SONIC_VLA_STATE_FORMAT={self._vla_state_format!r}; "
-                "expected rotlocal_v3 or raw64"
+                "expected rotlocal_v3, raw64, or raw93"
             )
         # ACT95 always uses the split 29+29+3+3 raw proprioception contract.
         self._use_vla_raw64_state = self._use_lerobot_vla and (
             self._vla_state_format == "raw64" or self._use_vla_raw95
         )
+        self._use_vla_raw93_state = self._use_lerobot_vla and self._vla_state_format == "raw93"
         raw_body_source_arg = "sonic_raw95_body_source" if self._use_vla_raw95 else "sonic_raw107_body_source"
         raw_body_source_env = "SONIC_RAW95_BODY_SOURCE" if self._use_vla_raw95 else "SONIC_RAW107_BODY_SOURCE"
         self._raw107_body_source = str(
@@ -1602,7 +1610,12 @@ class SonicActionProvider(ActionProvider):
         # [interface conversion] The raw checkpoint was trained with LeRobot
         # robot_type='g1'.  Keep the physical HumanoidArena robot identifier
         # separate from the metadata supplied to the policy.
-        self._lerobot_robot_type = "g1" if (self._use_vla_raw29 or self._use_vla_raw107 or self._use_vla_raw64_state) else self.enable_robot
+        self._lerobot_robot_type = "g1" if (
+            self._use_vla_raw29
+            or self._use_vla_raw107
+            or self._use_vla_raw64_state
+            or self._use_vla_raw93_state
+        ) else self.enable_robot
         self._lerobot_server_url = getattr(args_cli, "lerobot_server_url", "") or ""
         self._lerobot_server_timeout = float(getattr(args_cli, "lerobot_server_timeout", 5.0))
         self._lerobot_server_verify_ssl = bool(getattr(args_cli, "lerobot_server_verify_ssl", False))
@@ -1840,7 +1853,12 @@ class SonicActionProvider(ActionProvider):
             self._encoder = None
             self._decoder = None
             print(f"[SonicActionProvider] {self._vla_action_format} body source=direct_raw (audit mode)")
-        if self._use_vla_raw29 or self._use_vla_raw107 or self._use_vla_raw64_state:
+        if (
+            self._use_vla_raw29
+            or self._use_vla_raw107
+            or self._use_vla_raw64_state
+            or self._use_vla_raw93_state
+        ):
             print(
                 "[SonicActionProvider] raw policy observation joint order="
                 f"{self._raw_state_joint_order}"
@@ -2361,7 +2379,9 @@ class SonicActionProvider(ActionProvider):
         action_feature = (config.output_features or {}).get("action")
         state_shape = tuple(getattr(state_feature, "shape", ()) or ())
         action_shape = tuple(getattr(action_feature, "shape", ()) or ())
-        expected_state_shape = (93,) if self._use_vla_raw29 else (SONIC_VLA_STATE_DIM,)
+        expected_state_shape = (
+            (93,) if (self._use_vla_raw29 or self._use_vla_raw93_state) else (SONIC_VLA_STATE_DIM,)
+        )
         if state_shape and state_shape != expected_state_shape:
             raise ValueError(
                 f"[SonicActionProvider] VLA policy must use observation.state shape {expected_state_shape}, "
@@ -2584,7 +2604,7 @@ class SonicActionProvider(ActionProvider):
             ang_vel_b=ang_vel_b,
             gravity=gravity,
         )
-        if not self._use_vla_raw29:
+        if not (self._use_vla_raw29 or self._use_vla_raw93_state):
             return state64, components
         components["observation.last_action"] = self._vla_last_raw_action_dfs.copy()
         state93 = np.concatenate([state64, components["observation.last_action"]]).astype(np.float32)
@@ -2592,13 +2612,23 @@ class SonicActionProvider(ActionProvider):
 
     def _fetch_lerobot_action_chunk(self) -> np.ndarray:
         rgb = self._get_front_camera_rgb_for_vla()
-        if self._use_vla_raw29 or self._use_vla_raw107 or self._use_vla_raw64_state:
+        if (
+            self._use_vla_raw29
+            or self._use_vla_raw107
+            or self._use_vla_raw64_state
+            or self._use_vla_raw93_state
+        ):
             state, state_components = self._build_lerobot_raw107_observation()
         else:
             state = self._build_lerobot_vla_observation_state()
             state_components = None
         if self._lerobot_http_client is not None:
-            if self._use_vla_raw29 or self._use_vla_raw107 or self._use_vla_raw64_state:
+            if (
+                self._use_vla_raw29
+                or self._use_vla_raw107
+                or self._use_vla_raw64_state
+                or self._use_vla_raw93_state
+            ):
                 # Raw-state ACT checkpoints can be trained with an observation
                 # history (the act_95 checkpoints use 10 consecutive frames).
                 # Send every control tick and let policy.select_action retain
@@ -2609,7 +2639,7 @@ class SonicActionProvider(ActionProvider):
                     observation_state=state,
                     observation_components=state_components,
                     robot_type=self._lerobot_robot_type,
-                    task=self.task_name,
+                    task=self._policy_task,
                 ).reshape(1, -1)
             else:
                 action_chunk = self._lerobot_http_client.infer_chunk(
@@ -2617,7 +2647,7 @@ class SonicActionProvider(ActionProvider):
                     observation_state=state,
                     observation_components=state_components,
                     robot_type=self._lerobot_robot_type,
-                    task=self.task_name,
+                    task=self._policy_task,
                 )
             self._apply_lerobot_http_hand_actions()
         else:
@@ -2636,7 +2666,7 @@ class SonicActionProvider(ActionProvider):
                 preprocessor=self._lerobot_preprocessor,
                 postprocessor=self._lerobot_postprocessor,
                 use_amp=self._lerobot_device.type == "cuda",
-                task=self.task_name,
+                task=self._policy_task,
                 robot_type=self._lerobot_robot_type,
             )
             if isinstance(action, torch.Tensor):
@@ -2896,6 +2926,13 @@ class SonicActionProvider(ActionProvider):
         t_dec1 = time.perf_counter()
         raw_sonic_unclipped = action_sonic.flatten()[:29].astype(np.float32, copy=False)
         self._latest_decoder_raw_action = raw_sonic_unclipped.astype(np.float32, copy=True)
+        if self._use_vla_raw93_state:
+            if self._raw_state_joint_order == "mujoco":
+                self._vla_last_raw_action_dfs = reorder_sonic_joint_vector_to_mujoco(
+                    raw_sonic_unclipped, "decoder_raw_action"
+                )
+            else:
+                self._vla_last_raw_action_dfs = raw_sonic_unclipped.astype(np.float32, copy=True)
         self._last_action_hist = np.roll(self._last_action_hist, -1, axis=0)
         self._last_action_hist[-1] = raw_sonic_unclipped
         target_sonic = raw_sonic_unclipped * G1_ACTION_SCALE_ISAACLAB + self._sonic_default_np
@@ -2950,12 +2987,19 @@ class SonicActionProvider(ActionProvider):
 
         # [interface conversion] Audit path: execute the checkpoint's predicted
         # open-loop decoder raw action without clipping or smoothing.
+        raw_body_sonic = split.body_raw
+        if self._use_vla_raw93_state and self._raw_state_joint_order == "mujoco":
+            raw_body_sonic = reorder_mujoco_joint_vector_to_sonic(
+                split.body_raw, "raw107_action_body"
+            )
         target_sonic = sonic_raw_body_to_joint_targets(
-            split.body_raw,
+            raw_body_sonic,
             action_scale=G1_ACTION_SCALE_ISAACLAB,
             default_joint_pos=self._sonic_default_np,
         )
-        self._latest_decoder_raw_action = split.body_raw.copy()
+        self._latest_decoder_raw_action = raw_body_sonic.copy()
+        if self._use_vla_raw93_state:
+            self._vla_last_raw_action_dfs = split.body_raw.copy()
         self._latest_decoder_target = target_sonic.copy()
         return target_sonic
 
