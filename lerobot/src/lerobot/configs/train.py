@@ -34,6 +34,27 @@ TRAIN_CONFIG_NAME = "train_config.json"
 
 
 @dataclass
+class FSDPConfig:
+    """Optional Fully Sharded Data Parallel training configuration.
+
+    The default keeps the existing DDP behavior unchanged. ``full_shard``
+    partitions parameters, gradients, and optimizer state across ranks, which
+    is required for full fine-tuning large VLA policies on memory-constrained
+    GPUs.
+    """
+
+    enabled: bool = False
+    sharding_strategy: str = "FULL_SHARD"
+    backward_prefetch: str = "BACKWARD_PRE"
+    state_dict_type: str = "SHARDED_STATE_DICT"
+    use_orig_params: bool = True
+    sync_module_states: bool = True
+    limit_all_gathers: bool = True
+    forward_prefetch: bool = False
+    cpu_offload: bool = False
+
+
+@dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     env: envs.EnvConfig | None = None
@@ -69,6 +90,9 @@ class TrainPipelineConfig(HubMixin):
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
+    # Optional distributed model/optimizer sharding. Disabled by default so
+    # existing single-GPU and DDP launch commands retain their behavior.
+    fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
     use_rabc: bool = False  # Enable reward-weighted training
@@ -145,6 +169,20 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "'policy.repo_id' argument missing. Please specify it to push the model to the hub."
             )
+
+        if self.fsdp.enabled:
+            if self.policy.device == "cpu":
+                raise ValueError("FSDP training requires policy.device=cuda.")
+            if self.fsdp.sharding_strategy.upper() != "FULL_SHARD":
+                raise ValueError(
+                    "Only FSDP FULL_SHARD is supported by this training pipeline; "
+                    f"got {self.fsdp.sharding_strategy!r}."
+                )
+            if self.fsdp.state_dict_type.upper() != "SHARDED_STATE_DICT":
+                raise ValueError(
+                    "FSDP resumable checkpoints must use SHARDED_STATE_DICT; "
+                    f"got {self.fsdp.state_dict_type!r}."
+                )
 
         if self.use_rabc and not self.rabc_progress_path:
             # Auto-detect from dataset path

@@ -11,5 +11,5 @@ if [[ -n "${RESULTS_TAG_PREFIX:-}" ]]; then
 else
   export RESULTS_TAG="${RESULTS_TAG_BASE}"
 fi
-export MAX_STEPS="${MAX_STEPS:-2000}"
+export MAX_STEPS="${MAX_STEPS:-1300}"
 exec "${RUN_SCRIPT_DIR}/run_vla_eval_parallel.sh"

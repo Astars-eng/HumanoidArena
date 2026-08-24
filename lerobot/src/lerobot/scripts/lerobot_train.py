@@ -16,13 +16,16 @@
 import dataclasses
 import logging
 import time
+from collections.abc import Iterable
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from accelerate.utils import DistributedType
 from termcolor import colored
+from torch import nn
 from torch.optim import Optimizer
 from tqdm import tqdm
 
@@ -38,6 +41,7 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
+from lerobot.utils.constants import TRAINING_STATE_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -45,7 +49,9 @@ from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
+    load_training_step,
     save_checkpoint,
+    save_training_step,
     update_last_checkpoint,
 )
 from lerobot.utils.utils import (
@@ -54,6 +60,91 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _pi05_fsdp_auto_wrap_policy(
+    module: nn.Module,
+    recurse: bool,
+    nonwrapped_numel: int,
+) -> bool:
+    """Wrap parameter-owning modules that PI0.5 actually calls.
+
+    PI0.5 computes joint VLM/expert attention by calling projection and norm
+    submodules directly instead of invoking each decoder layer's ``forward``.
+    Wrapping whole decoder layers would therefore leave their parameters
+    sharded when accessed. Parameter-owning modules provide safe all-gather
+    boundaries for this custom forward implementation.
+
+    PaliGemma's output head is tied to the input embedding and is not used by
+    PI0.5 policy training. Leaving that head under the root wrapper avoids
+    placing the same shared parameter in two nested FSDP units.
+    """
+    if recurse:
+        return True
+    if nonwrapped_numel <= 0:
+        return False
+    direct_parameters = tuple(module.parameters(recurse=False))
+    if not direct_parameters or not any(parameter.requires_grad for parameter in direct_parameters):
+        return False
+    is_unused_tied_lm_head = (
+        isinstance(module, nn.Linear) and module.bias is None and module.out_features >= 200_000
+    )
+    return not is_unused_tied_lm_head
+
+
+def _make_accelerator(cfg: TrainPipelineConfig) -> Accelerator:
+    force_cpu = cfg.policy.device == "cpu"
+    if cfg.fsdp.enabled:
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            fsdp_version=1,
+            reshard_after_forward=cfg.fsdp.sharding_strategy,
+            backward_prefetch=cfg.fsdp.backward_prefetch,
+            auto_wrap_policy=_pi05_fsdp_auto_wrap_policy,
+            cpu_offload=cfg.fsdp.cpu_offload,
+            state_dict_type=cfg.fsdp.state_dict_type,
+            limit_all_gathers=cfg.fsdp.limit_all_gathers,
+            use_orig_params=cfg.fsdp.use_orig_params,
+            sync_module_states=cfg.fsdp.sync_module_states,
+            forward_prefetch=cfg.fsdp.forward_prefetch,
+            # PI0.5 already applies its own non-reentrant checkpointing around
+            # the joint VLM/expert computation.
+            activation_checkpointing=False,
+        )
+        return Accelerator(
+            step_scheduler_with_optimizer=False,
+            fsdp_plugin=fsdp_plugin,
+            cpu=force_cpu,
+        )
+
+    from accelerate.utils import DistributedDataParallelKwargs
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    return Accelerator(
+        step_scheduler_with_optimizer=False,
+        kwargs_handlers=[ddp_kwargs],
+        cpu=force_cpu,
+    )
+
+
+@torch.no_grad()
+def _clip_fsdp_mixed_dtype_grad_norm_(
+    parameters: Iterable[nn.Parameter],
+    max_norm: float,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    """Clip mixed BF16/FP32 FSDP gradient shards by their global L2 norm."""
+    gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    local_squared_norm = torch.zeros((), dtype=torch.float32, device=accelerator.device)
+    for gradient in gradients:
+        gradient_norm = torch.linalg.vector_norm(gradient.detach(), ord=2, dtype=torch.float32)
+        local_squared_norm.add_(gradient_norm.square())
+
+    global_squared_norm = accelerator.reduce(local_squared_norm, reduction="sum")
+    total_norm = global_squared_norm.sqrt()
+    clip_coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    for gradient in gradients:
+        gradient.mul_(clip_coefficient.to(device=gradient.device, dtype=gradient.dtype))
+    return total_norm
 
 
 def update_policy(
@@ -123,7 +214,10 @@ def update_policy(
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        if accelerator.distributed_type == DistributedType.FSDP:
+            grad_norm = _clip_fsdp_mixed_dtype_grad_norm_(policy.parameters(), grad_clip_norm, accelerator)
+        else:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
@@ -174,17 +268,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        accelerator = _make_accelerator(cfg)
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
-        # Force the device to be CPU when policy.device is set to CPU.
-        force_cpu = cfg.policy.device == "cpu"
-        accelerator = Accelerator(
-            step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
-            cpu=force_cpu,
-        )
+    using_fsdp = accelerator.distributed_type == DistributedType.FSDP
 
     init_logging(accelerator=accelerator)
 
@@ -342,7 +428,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     step = 0  # number of policy updates (forward + backward + optim)
 
-    if cfg.resume:
+    if cfg.resume and not using_fsdp:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -395,6 +481,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+    if cfg.resume and using_fsdp:
+        training_state_dir = cfg.checkpoint_path / TRAINING_STATE_DIR
+        accelerator.load_state(str(training_state_dir))
+        step = load_training_step(training_state_dir)
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -478,9 +568,33 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
-            if is_main_process:
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            if using_fsdp:
+                if is_main_process:
+                    logging.info(f"Checkpoint FSDP policy after step {step}")
+                training_state_dir = checkpoint_dir / TRAINING_STATE_DIR
+                # Accelerate stores sharded model/optimizer state for an
+                # efficient same-world-size resume.
+                accelerator.save_state(str(training_state_dir))
+                # All ranks must enter this collective. Only rank 0 receives
+                # the complete CPU state dict and writes the inference model.
+                policy_state_dict = accelerator.get_state_dict(policy)
+                if is_main_process:
+                    save_training_step(step, training_state_dir)
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=accelerator.unwrap_model(policy),
+                        optimizer=None,
+                        scheduler=None,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        policy_state_dict=policy_state_dict,
+                        save_training_state_files=False,
+                    )
+            elif is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -491,10 +605,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                 )
+
+            accelerator.wait_for_everyone()
+            if is_main_process:
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
-
             accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:

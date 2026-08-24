@@ -44,7 +44,21 @@
 | `HSI_sit_sofa_run_vla_eval_parallel.sh` | Sit on the sofa. |
 | `HSI_vision_navi_run_vla_eval_parallel.sh` | Avoid obstacles and move to the yellow marked area. |
 
-这对 Flow Matching 必须正确；ACT/DP 即使不消费文本，也可以安全共用入口。server 固定使用 verbatim task，避免把 `football` 改写成训练中没有的 `soccer`。
+这对 Flow Matching 必须正确；官方发布的 ACT/DP baseline 不包含 tokenizer 或文本编码器，因而不会消费文本，但仍可安全共用入口。server 固定使用 verbatim task，避免把 `football` 改写成训练中没有的 `soccer`。三类模型获得相同的 prompt 字段，但只有 Flow Matching 将其作为模型条件；这与官方发布的三类 baseline 实现一致，并不代表三类架构具有相同的文本条件能力。
+
+## 论文任务时限
+
+七个任务 wrapper 默认采用论文 Table S1 的最大 episode 步数；仍可通过显式设置 `MAX_STEPS` 覆盖：
+
+| wrapper | `MAX_STEPS` |
+|---|---:|
+| `HOI_football_run_vla_eval_parallel.sh` | 1300 |
+| `HOI_double_desk_run_vla_eval_parallel.sh` | 2000 |
+| `HOI_pp_box_run_vla_eval_parallel.sh` | 2000 |
+| `HSI_open_door_run_vla_eval_parallel.sh` | 1800 |
+| `HSI_sit_sofa_run_vla_eval_parallel.sh` | 1050 |
+| `HSI_boxing_run_vla_eval_parallel.sh` | 1500 |
+| `HSI_vision_navi_run_vla_eval_parallel.sh` | 1800 |
 
 ## 如何运行
 
@@ -70,7 +84,7 @@ SEEDS_OVERRIDE="0" REPEATS_PER_SEED=1 RECORD_VIDEO_EVERY_N=1 GPU_ID=0 \
 /DATA/disk0/fym/vla/outputs/fm_humanoidarena_sonic_merged_act107_0820_fym/checkpoints/100000/pretrained_model
 ```
 
-不设置 `MODEL_PATH` / `MODEL_PATHS_CSV` 时，一个 wrapper 会依次评测上述 ACT、DP、Flow Matching 三个默认 checkpoint。正式七任务评测分别运行七个 wrapper；每个 YAML 的默认 seeds、repeats 和 max steps 会自动加载。建议先 smoke test，再使用完整默认重复数，因为完整评测 episode 数较多。
+不设置 `MODEL_PATH` / `MODEL_PATHS_CSV` 时，一个 wrapper 会依次评测上述 ACT、DP、Flow Matching 三个默认 checkpoint。正式七任务评测分别运行七个 wrapper；默认 seeds/repeats 来自评测入口，max steps 由各任务 wrapper 按论文 Table S1 设置。建议先 smoke test，再使用完整默认重复数，因为完整评测 episode 数较多。
 
 `merged107` 默认关闭 GPU 文件锁，因此可以在同一张物理 GPU 上启动多个任务。此时各进程仍会自动选择不同的 HTTP server 端口，但显存和算力由这些进程共享；显存不足时请减少并发。若希望一张 GPU 同时只允许一个评测进程，设置 `GPU_LOCK=1`。
 

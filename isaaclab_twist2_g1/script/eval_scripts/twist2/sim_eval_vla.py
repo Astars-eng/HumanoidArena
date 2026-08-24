@@ -60,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat_idx", type=int, default=0)
     parser.add_argument("--episode_seed", type=int, default=None)
     parser.add_argument("--episode_batch_json", type=str, default="")
-    parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--max_steps", type=int, required=True)
     parser.add_argument("--model_path", type=str, required=True, help="TWIST2 ONNX path")
     parser.add_argument("--lerobot_server_url", type=str, required=True)
     parser.add_argument("--lerobot_server_timeout", type=float, default=5.0)

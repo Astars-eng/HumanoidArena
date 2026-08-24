@@ -331,7 +331,7 @@ def main() -> int:
     parser.add_argument("--seed", dest="seeds", action="append", type=int, required=True)
     parser.add_argument("--repeats_per_seed", type=int, default=1)
     parser.add_argument("--num_envs", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--max_steps", type=int, required=True)
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--post_termination_record_steps", type=int, default=0)
     parser.add_argument("--robot_type", type=str, default="unitree_g1_refpose_v3_1")

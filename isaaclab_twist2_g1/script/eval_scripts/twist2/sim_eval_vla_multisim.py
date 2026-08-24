@@ -46,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode_batch_json", type=str, required=True)
     parser.add_argument("--server_urls_json", type=str, required=True)
     parser.add_argument("--num_envs", type=int, required=True)
-    parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--max_steps", type=int, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--lerobot_server_timeout", type=float, default=5.0)
     parser.add_argument("--lerobot_server_verify_ssl", action="store_true", default=False)

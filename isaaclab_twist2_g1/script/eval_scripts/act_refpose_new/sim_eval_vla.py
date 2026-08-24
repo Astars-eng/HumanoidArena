@@ -66,7 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat_idx", type=int, default=0)
     parser.add_argument("--episode_seed", type=int, default=None)
     parser.add_argument("--episode_batch_json", type=str, default="")
-    parser.add_argument("--max_steps", type=int, default=300)
+    parser.add_argument("--max_steps", type=int, required=True)
     parser.add_argument("--model_path", type=str, default="", help="Compatibility argument (unused in SONIC VLA eval)")
     parser.add_argument("--sonic_encoder_path", type=str, required=True, help="SONIC encoder ONNX path (29DoF controller)")
     parser.add_argument("--sonic_decoder_path", type=str, required=True, help="SONIC decoder ONNX path (29DoF controller)")
