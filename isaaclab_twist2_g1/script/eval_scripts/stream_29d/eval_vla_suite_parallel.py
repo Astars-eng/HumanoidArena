@@ -286,6 +286,9 @@ def _build_failure_result(args, server_url: str, run_dir: Path, task_spec: dict,
         'max_reward': 0.0,
         'max_reward_scaled': 0.0,
         'video_path': '',
+        'front_video_path': '',
+        'third_person_video_path': '',
+        'dual_video_recorded': False,
         'server_url': server_url,
         'log_path': str(sim_log),
         'returncode': -1,
@@ -422,6 +425,12 @@ def main() -> int:
     parser.add_argument('--video_fps', type=int, default=30)
     parser.add_argument('--post_termination_record_steps', type=int, default=0)
     parser.add_argument('--record_video_every_n', type=int, default=1)
+    parser.add_argument('--third_person_camera_distance', type=float, default=4.0)
+    parser.add_argument('--third_person_camera_height', type=float, default=2.2)
+    parser.add_argument('--third_person_camera_target_height', type=float, default=0.9)
+    parser.add_argument('--third_person_camera_lateral_offset', type=float, default=1.25)
+    parser.add_argument('--third_person_camera_image_width', type=int, default=1280)
+    parser.add_argument('--third_person_camera_image_height', type=int, default=720)
     parser.add_argument('--step_log_every_n', type=int, default=0)
     parser.add_argument('--verbose_startup', action='store_true', default=False)
     parser.add_argument('--robot_type', type=str, default='unitree_g1_refpose_v3_1')

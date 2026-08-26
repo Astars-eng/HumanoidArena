@@ -211,6 +211,9 @@ def _load_result_or_fallback(
             "max_reward": 0.0,
             "max_reward_scaled": 0.0,
             "video_path": "",
+            "front_video_path": "",
+            "third_person_video_path": "",
+            "dual_video_recorded": False,
             "server_url": server_url,
             "returncode": returncode,
         }
@@ -298,6 +301,18 @@ def _run_episode(
         str(args.post_termination_record_steps),
         "--record_video_every_n",
         str(args.record_video_every_n),
+        "--third_person_camera_distance",
+        str(args.third_person_camera_distance),
+        "--third_person_camera_height",
+        str(args.third_person_camera_height),
+        "--third_person_camera_target_height",
+        str(args.third_person_camera_target_height),
+        "--third_person_camera_lateral_offset",
+        str(args.third_person_camera_lateral_offset),
+        "--third_person_camera_image_width",
+        str(args.third_person_camera_image_width),
+        "--third_person_camera_image_height",
+        str(args.third_person_camera_image_height),
         "--step_log_every_n",
         str(args.step_log_every_n),
         "--episode_index",
@@ -435,6 +450,18 @@ def _run_episode_batch(
         args.robot_type,
         "--record_video_every_n",
         str(args.record_video_every_n),
+        "--third_person_camera_distance",
+        str(args.third_person_camera_distance),
+        "--third_person_camera_height",
+        str(args.third_person_camera_height),
+        "--third_person_camera_target_height",
+        str(args.third_person_camera_target_height),
+        "--third_person_camera_lateral_offset",
+        str(args.third_person_camera_lateral_offset),
+        "--third_person_camera_image_width",
+        str(args.third_person_camera_image_width),
+        "--third_person_camera_image_height",
+        str(args.third_person_camera_image_height),
         "--step_log_every_n",
         str(args.step_log_every_n),
         "--recording_save_dir",
@@ -671,6 +698,9 @@ def _write_summary(run_dir: Path, results: list[dict]) -> None:
         "max_reward",
         "max_reward_scaled",
         "video_path",
+        "front_video_path",
+        "third_person_video_path",
+        "dual_video_recorded",
         "log_path",
         "vla_trace_path",
         "server_url",
@@ -699,6 +729,12 @@ def main() -> int:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--post_termination_record_steps", type=int, default=0)
     parser.add_argument("--record_video_every_n", type=int, default=1)
+    parser.add_argument("--third_person_camera_distance", type=float, default=4.0)
+    parser.add_argument("--third_person_camera_height", type=float, default=2.2)
+    parser.add_argument("--third_person_camera_target_height", type=float, default=0.9)
+    parser.add_argument("--third_person_camera_lateral_offset", type=float, default=1.25)
+    parser.add_argument("--third_person_camera_image_width", type=int, default=1280)
+    parser.add_argument("--third_person_camera_image_height", type=int, default=720)
     parser.add_argument("--step_log_every_n", type=int, default=0)
     parser.add_argument("--verbose_startup", action="store_true", default=False)
     parser.add_argument("--robot_type", type=str, default="unitree_g1_refpose_v3_1")

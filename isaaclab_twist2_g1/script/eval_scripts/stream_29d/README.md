@@ -72,6 +72,30 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 - `SERVER_DISABLE_ACTION_DELTA_REFINER=1`：旁路 delta refiner，仅用于明确标注的消融。
 - `SONIC_RAW_STATE_JOINT_ORDER=mujoco`：当前 29D contract 的默认关节顺序，不应随意覆盖。
 
+## 双视角录像
+
+每个被 `RECORD_VIDEO_EVERY_N` 选中的 episode 会同时保存两个视频：
+
+- `videos/{success,failure}/<episode>__<result>.mp4`：原有机器人前置相机画面，用于核对模型视觉输入。
+- `videos/world_camera/{success,failure}/<episode>__third_person__<result>.mp4`：自动跟随机器人朝向的后侧三分之四视角，用于完整分析全身动作。
+
+第一视角沿用原有 `videos/success` 和 `videos/failure` 目录；转换后的第三视角统一放在
+`videos/world_camera/` 下，并继续按 `success`、`failure` 分类。episode JSON、`summary.jsonl` 和
+`summary.csv` 分别通过 `front_video_path` 与 `third_person_video_path` 记录路径；只有两路均成功保存时
+`dual_video_recorded=true`。所有通过本目录串行、并行或持久仿真入口运行的任务和模型共享该录像逻辑。
+
+第三视角默认输出 1280×720，可按任务需要调整：
+
+```bash
+THIRD_PERSON_CAMERA_DISTANCE=4.0 \
+THIRD_PERSON_CAMERA_HEIGHT=2.2 \
+THIRD_PERSON_CAMERA_TARGET_HEIGHT=0.9 \
+THIRD_PERSON_CAMERA_LATERAL_OFFSET=1.25 \
+THIRD_PERSON_CAMERA_IMAGE_WIDTH=1280 \
+THIRD_PERSON_CAMERA_IMAGE_HEIGHT=720 \
+bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
+```
+
 训练 fork 或 checkpoint 固化引用路径不匹配时：
 
 ```bash
