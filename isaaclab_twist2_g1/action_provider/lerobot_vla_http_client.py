@@ -57,6 +57,15 @@ class LeRobotVLAHttpClient:
         """Return the optional hand chunks aligned with the latest body chunk."""
         return {key: value.copy() for key, value in self._last_hand_action_chunk.items()}
 
+    def set_trace_path(self, trace_path: str | os.PathLike[str] | None) -> None:
+        """Switch the JSONL destination at an episode boundary.
+
+        Persistent-simulator evaluation reuses one client for many episodes,
+        so the destination cannot be treated as a process-lifetime setting.
+        """
+        self._trace_path = "" if trace_path is None else str(trace_path).strip()
+        self._trace_step_idx = 0
+
     def _append_trace(self, payload: dict[str, Any]) -> None:
         if not self._trace_path:
             return
@@ -239,21 +248,43 @@ class LeRobotVLAHttpClient:
         if "action" not in response:
             raise RuntimeError("Expected action in single-action server response")
         action = np.asarray(response["action"], dtype=np.float32).reshape(-1)
-        self._append_trace(
-            {
-                "event": "infer_single",
-                "timestamp": time.time(),
-                "step_idx": self._trace_step_idx,
-                "robot_type": robot_type,
-                "task": task_name,
-                "front_rgb_shape": list(rgb.shape),
-                "observation_state": state.tolist(),
-                "action": action.tolist(),
-                "hand_actions": {
-                    key: value.tolist() for key, value in self._last_hand_actions.items()
-                },
+        action_trace = response.get("action_trace")
+        if action_trace is not None and not isinstance(action_trace, dict):
+            raise RuntimeError(
+                f"Expected action_trace to be an object, got {type(action_trace).__name__}"
+            )
+        trace_record = {
+            "event": "infer_single",
+            "source": "sent",
+            "timestamp": time.time(),
+            "step_idx": self._trace_step_idx,
+            "action_step_index": self._trace_step_idx,
+            "robot_type": robot_type,
+            "task": task_name,
+            "front_rgb_shape": list(rgb.shape),
+            "observation_state": state.tolist(),
+            "action": action.tolist(),
+            "action.applied_action": action.tolist(),
+            "hand_actions": {
+                key: value.tolist() for key, value in self._last_hand_actions.items()
+            },
+        }
+        if action_trace is not None:
+            trace_record["action_trace"] = action_trace
+            trace_record.update(action_trace.get("action_metadata") or {})
+            field_mapping = {
+                "base_action": "action.applied_action_before_refiner",
+                "refined_action": "action.refined_action",
+                "refiner_applied_delta": "action.refiner_applied_delta",
+                "normalized_base_action": "action.normalized_base_action_before_refiner",
+                "normalized_refined_action": "action.normalized_refined_action",
+                "normalized_refiner_applied_delta": "action.normalized_refiner_applied_delta",
             }
-        )
+            for response_key, trace_key in field_mapping.items():
+                value = action_trace.get(response_key)
+                if value is not None:
+                    trace_record[trace_key] = value
+        self._append_trace(trace_record)
         self._trace_step_idx += 1
         return action
 

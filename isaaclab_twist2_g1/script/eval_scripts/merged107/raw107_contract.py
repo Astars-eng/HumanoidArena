@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-fast contract validation for merged ACT/DP/flow-matching raw107 checkpoints."""
+"""Fail-fast contract validation for merged raw107 checkpoints."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SUPPORTED_POLICY_TYPES = {"act", "diffusion", "multi_task_dit"}
+SUPPORTED_POLICY_TYPES = {"act", "diffusion", "multi_task_dit", "pi05"}
 EXPECTED_INPUT_SHAPES = {
     "observation.joint_pos": [29],
     "observation.joint_vel": [29],
@@ -51,12 +51,14 @@ def policy_family(config: dict) -> str:
     policy_type = config.get("type")
     if policy_type == "act":
         return "act"
+    if policy_type == "pi05":
+        return "pi05"
     if policy_type == "diffusion":
         return "dp"
     if policy_type == "multi_task_dit" and config.get("objective") == "flow_matching":
         return "flowmatching"
     raise ValueError(
-        "unsupported policy contract: expected ACT, diffusion, or "
+        "unsupported policy contract: expected ACT, diffusion, PI0.5, or "
         f"multi_task_dit flow_matching; got type={policy_type!r}, "
         f"objective={config.get('objective')!r}"
     )
@@ -77,8 +79,13 @@ def validate_checkpoint(path: str | Path) -> dict:
     family = policy_family(config)
     _require_positive_int(config, "n_obs_steps")
     _require_positive_int(config, "n_action_steps")
-    if family == "act":
-        _require_positive_int(config, "chunk_size")
+    if family in {"act", "pi05"}:
+        chunk_size = _require_positive_int(config, "chunk_size")
+        if config["n_action_steps"] > chunk_size:
+            raise ValueError(
+                f"n_action_steps ({config['n_action_steps']}) must not exceed "
+                f"chunk_size ({chunk_size})"
+            )
     else:
         horizon = _require_positive_int(config, "horizon")
         if config["n_action_steps"] > horizon:
@@ -97,16 +104,16 @@ def validate_checkpoint(path: str | Path) -> dict:
         if not (policy_dir / required_file).is_file():
             raise FileNotFoundError(f"checkpoint artifact not found: {policy_dir / required_file}")
 
-    if family == "flowmatching":
+    if family in {"flowmatching", "pi05"}:
         preprocessor = json.loads((policy_dir / "policy_preprocessor.json").read_text(encoding="utf-8"))
         tokenizer_steps = [
             step for step in preprocessor.get("steps", [])
             if step.get("registry_name") == "tokenizer_processor"
         ]
         if not tokenizer_steps:
-            raise ValueError("flow-matching checkpoint preprocessor has no tokenizer_processor")
+            raise ValueError(f"{family} checkpoint preprocessor has no tokenizer_processor")
         _require_equal(
-            "flow-matching tokenizer task_key",
+            f"{family} tokenizer task_key",
             (tokenizer_steps[0].get("config") or {}).get("task_key"),
             "task",
         )

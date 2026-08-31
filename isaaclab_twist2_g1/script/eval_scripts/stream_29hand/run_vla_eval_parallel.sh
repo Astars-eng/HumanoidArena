@@ -110,8 +110,13 @@ SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-/share/beingm/yuxuan
 SERVER_VERBATIM_TASK="${SERVER_VERBATIM_TASK:-1}"
 SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE="${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE:-1}"
 SERVER_DISABLE_ACTION_DELTA_REFINER="${SERVER_DISABLE_ACTION_DELTA_REFINER:-0}"
+SERVER_ZERO_INFERENCE_NOISE="${SERVER_ZERO_INFERENCE_NOISE:-0}"
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" != "0" && "${SERVER_DISABLE_ACTION_DELTA_REFINER}" != "1" ]]; then
   echo "Error: SERVER_DISABLE_ACTION_DELTA_REFINER must be 0 or 1, got: ${SERVER_DISABLE_ACTION_DELTA_REFINER}" >&2
+  exit 2
+fi
+if [[ "${SERVER_ZERO_INFERENCE_NOISE}" != "0" && "${SERVER_ZERO_INFERENCE_NOISE}" != "1" ]]; then
+  echo "Error: SERVER_ZERO_INFERENCE_NOISE must be 0 or 1, got: ${SERVER_ZERO_INFERENCE_NOISE}" >&2
   exit 2
 fi
 SERVER_GPU_IDS="${GPU_ID}"
@@ -239,6 +244,9 @@ DEFAULT_RESULTS_TAG="${TASK_RESULT_NAME}_stream_29hand"
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]]; then
   DEFAULT_RESULTS_TAG="${DEFAULT_RESULTS_TAG}_no_refiner"
 fi
+if [[ "${SERVER_ZERO_INFERENCE_NOISE}" == "1" ]]; then
+  DEFAULT_RESULTS_TAG="${DEFAULT_RESULTS_TAG}_zero_noise"
+fi
 RESULTS_TAG_BASE="${RESULTS_TAG:-${DEFAULT_RESULTS_TAG}}"
 if [[ -n "${RESULTS_TAG_PREFIX:-}" ]]; then
   RESULTS_TAG="${RESULTS_TAG_PREFIX}_${RESULTS_TAG_BASE}"
@@ -256,6 +264,7 @@ echo "Task: ${TASK_NAME}"
 echo "Result task label: ${TASK_RESULT_NAME}"
 echo "Server task mode: $([[ "${SERVER_VERBATIM_TASK}" == "1" ]] && printf verbatim || printf mapped)"
 echo "Action delta refiner: $([[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]] && printf disabled || printf enabled)"
+echo "Inference noise: $([[ "${SERVER_ZERO_INFERENCE_NOISE}" == "1" ]] && printf zeros || printf sampled)"
 echo "GPU: physical ${GPU_ID}; server=${SERVER_DEVICE} with CUDA_VISIBLE_DEVICES=${GPU_ID}"
 echo "Isaac device: ${ISAAC_DEVICE}"
 echo "Server Python: ${SERVER_PYTHON}"
@@ -313,6 +322,9 @@ if [[ "${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE}" == "1" ]]; then
 fi
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]]; then
   ARGS+=(--server_disable_action_delta_refiner)
+fi
+if [[ "${SERVER_ZERO_INFERENCE_NOISE}" == "1" ]]; then
+  ARGS+=(--server_zero_inference_noise)
 fi
 if [[ "${GPU_LOCK}" != "1" ]]; then
   ARGS+=(--disable_gpu_lock)

@@ -17,6 +17,7 @@ SONIC_RAW29_POLICY_ACTION_DIM = 29
 SONIC_RAW_BODY_ACTION_DIM = 29
 SONIC_RAW_ENCODER_TOKEN_DIM = 64
 SONIC_RAW_HAND_ACTION_DIM = 7
+SONIC_RAW107_HAND_MODES = ("policy", "open")
 
 # Index a 29-D vector recorded in SONIC IsaacLab order to obtain the
 # DFS/MuJoCo order used by the corrected HumanoidArena LeRobot datasets.
@@ -122,6 +123,28 @@ def split_sonic_raw_policy_action(action: np.ndarray) -> SonicRawPolicyAction:
         encoder_token=vector[body_end:token_end].copy(),
         left_hand=vector[token_end:left_end].copy(),
         right_hand=vector[left_end:].copy(),
+    )
+
+
+def select_sonic_raw107_hand_targets(
+    split: SonicRawPolicyAction,
+    *,
+    mode: str,
+    left_open_pose: np.ndarray,
+    right_open_pose: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select executed hand targets without changing raw107 body/token outputs."""
+
+    normalized_mode = str(mode or "policy").strip().lower()
+    if normalized_mode == "policy":
+        return split.left_hand.copy(), split.right_hand.copy()
+    if normalized_mode == "open":
+        return (
+            _finite_vector(left_open_pose, SONIC_RAW_HAND_ACTION_DIM, "left open hand pose").copy(),
+            _finite_vector(right_open_pose, SONIC_RAW_HAND_ACTION_DIM, "right open hand pose").copy(),
+        )
+    raise ValueError(
+        f"Unsupported raw107 hand mode {mode!r}; expected one of {SONIC_RAW107_HAND_MODES}"
     )
 
 

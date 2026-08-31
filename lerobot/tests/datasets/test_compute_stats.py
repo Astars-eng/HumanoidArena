@@ -642,7 +642,7 @@ def test_compute_episode_stats_string_features_skipped():
 
 
 def test_aggregate_feature_stats_with_quantiles():
-    """Test aggregating feature stats that include quantiles."""
+    """Aggregated quantiles form a conservative envelope, not a weighted average."""
     stats_ft_list = [
         {
             "min": np.array([1.0]),
@@ -670,12 +670,11 @@ def test_aggregate_feature_stats_with_quantiles():
     assert "q01" in result
     assert "q99" in result
 
-    # Verify quantile aggregation (weighted average)
-    expected_q01 = (1.5 * 100 + 2.5 * 150) / 250  # ≈ 2.1
-    expected_q99 = (9.5 * 100 + 11.5 * 150) / 250  # ≈ 10.7
-
-    np.testing.assert_allclose(result["q01"], np.array([expected_q01]), atol=1e-6)
-    np.testing.assert_allclose(result["q99"], np.array([expected_q99]), atol=1e-6)
+    # Exact global quantiles cannot be recovered from per-source summaries.
+    # Lower quantiles use the minimum and upper quantiles use the maximum so
+    # the resulting normalization interval cannot be narrower than a source.
+    np.testing.assert_allclose(result["q01"], np.array([1.5]), atol=1e-6)
+    np.testing.assert_allclose(result["q99"], np.array([11.5]), atol=1e-6)
 
 
 def test_aggregate_stats_mixed_quantiles():

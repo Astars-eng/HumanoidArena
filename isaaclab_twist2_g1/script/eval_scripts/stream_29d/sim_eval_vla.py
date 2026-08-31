@@ -20,7 +20,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from task_runtime_profiles import apply_task_runtime_profile
-from third_person_camera import compute_follow_camera_pose, world_camera_video_dir
+from third_person_camera import world_camera_video_dir
 
 from isaaclab.app import AppLauncher
 
@@ -113,10 +113,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--post_termination_record_steps", type=int, default=0)
     parser.add_argument("--record_video_every_n", type=int, default=1)
-    parser.add_argument("--third_person_camera_distance", type=float, default=4.0)
-    parser.add_argument("--third_person_camera_height", type=float, default=2.2)
-    parser.add_argument("--third_person_camera_target_height", type=float, default=0.9)
-    parser.add_argument("--third_person_camera_lateral_offset", type=float, default=1.25)
     parser.add_argument("--third_person_camera_image_width", type=int, default=1280)
     parser.add_argument("--third_person_camera_image_height", type=int, default=720)
     parser.add_argument("--step_log_every_n", type=int, default=0)
@@ -158,14 +154,6 @@ def _should_log_reward_step(args, step_idx: int) -> bool:
 def _validate_third_person_camera_args(args) -> None:
     if int(args.third_person_camera_image_width) <= 0 or int(args.third_person_camera_image_height) <= 0:
         raise ValueError("third-person camera image dimensions must be positive")
-    compute_follow_camera_pose(
-        (0.0, 0.0, 0.0),
-        (1.0, 0.0, 0.0, 0.0),
-        distance=float(args.third_person_camera_distance),
-        camera_height=float(args.third_person_camera_height),
-        target_height=float(args.third_person_camera_target_height),
-        lateral_offset=float(args.third_person_camera_lateral_offset),
-    )
 
 
 def _cuda_device_index(device: str) -> int | None:
@@ -338,37 +326,6 @@ def _capture_camera_rgb(env, camera_name: str):
     if frame.dtype != "uint8":
         frame = frame.clip(0, 255).astype("uint8")
     return frame
-
-
-def _update_third_person_camera_pose(env, args_cli) -> None:
-    """Keep the full robot centered with a rear three-quarter chase view."""
-    if "world_camera" not in env.scene.keys():
-        raise RuntimeError("required third-person camera is missing from scene: world_camera")
-    robot = env.scene["robot"]
-    root_pos = getattr(robot.data, "root_pos_w", None)
-    root_quat = getattr(robot.data, "root_quat_w", None)
-    if root_pos is None or root_quat is None:
-        root_state = getattr(robot.data, "root_state_w", None)
-        if root_state is None:
-            raise RuntimeError("robot root pose is unavailable for third-person camera tracking")
-        root_pos = root_state[:, :3]
-        root_quat = root_state[:, 3:7]
-
-    distance = float(args_cli.third_person_camera_distance)
-    camera_height = float(args_cli.third_person_camera_height)
-    target_height = float(args_cli.third_person_camera_target_height)
-    lateral_offset = float(args_cli.third_person_camera_lateral_offset)
-    eye_xyz, target_xyz = compute_follow_camera_pose(
-        root_pos[0].detach().cpu().tolist(),
-        root_quat[0].detach().cpu().tolist(),
-        distance=distance,
-        camera_height=camera_height,
-        target_height=target_height,
-        lateral_offset=lateral_offset,
-    )
-    eye = root_pos.new_tensor([eye_xyz])
-    target = root_pos.new_tensor([target_xyz])
-    env.scene["world_camera"].set_world_poses_from_view(eye, target)
 
 
 def _record_episode_video_frames(env, recorders: dict[str, object]) -> None:
@@ -637,6 +594,7 @@ def _build_single_episode_spec(args_cli) -> dict:
         "model_label": args_cli.model_label,
         "eval_model_path": args_cli.eval_model_path,
         "recording_save_dir": args_cli.recording_save_dir,
+        "vla_trace_path": os.environ.get("LEROBOT_VLA_TRACE_PATH", "").strip(),
         "max_steps": int(args_cli.max_steps),
     }
 
@@ -667,6 +625,7 @@ def _load_episode_specs(args_cli) -> list[dict]:
                 "model_label": str(entry.get("model_label", args_cli.model_label)),
                 "eval_model_path": str(entry.get("eval_model_path", args_cli.eval_model_path)),
                 "recording_save_dir": str(entry.get("recording_save_dir", args_cli.recording_save_dir)),
+                "vla_trace_path": str(entry.get("vla_trace_path", "")),
                 "max_steps": int(entry.get("max_steps", args_cli.max_steps)),
             }
         )
@@ -707,6 +666,15 @@ def _reset_lerobot_runtime_seed(action_provider, episode_seed: int):
         client.reset(seed=int(episode_seed))
 
 
+def _set_lerobot_trace_path(action_provider, trace_path: str) -> None:
+    client = getattr(action_provider, "_lerobot_http_client", None)
+    if client is None:
+        return
+    setter = getattr(client, "set_trace_path", None)
+    if not callable(setter):
+        raise RuntimeError("LeRobot HTTP client does not support per-episode trace paths")
+    setter(trace_path or None)
+
 
 
 def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: str, *, success: bool, failure_reason: str, step_idx: int, terminal_step_idx: int, final_reward: float, final_reward_scaled: float, max_reward: float, max_reward_scaled: float, video_path: str, third_person_video_path: str, started_at: float, error: str = "", terminal_detail: str = "", env=None) -> dict:
@@ -734,16 +702,14 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "video_recorded": bool(video_path),
         "dual_video_recorded": bool(video_path and third_person_video_path),
         "third_person_camera": {
-            "mode": "robot_follow",
-            "distance": float(args_cli.third_person_camera_distance),
-            "height": float(args_cli.third_person_camera_height),
-            "target_height": float(args_cli.third_person_camera_target_height),
-            "lateral_offset": float(args_cli.third_person_camera_lateral_offset),
+            "mode": "fixed_world",
+            "pose_source": "scene_config",
             "resolution": [
                 int(args_cli.third_person_camera_image_width),
                 int(args_cli.third_person_camera_image_height),
             ],
         },
+        "vla_trace_path": str(spec.get("vla_trace_path", "")),
         "server_url": server_url,
         "sonic_vla_action_format": str(args_cli.sonic_vla_action_format),
         "sonic_raw107_body_source": str(args_cli.sonic_raw107_body_source),
@@ -808,18 +774,16 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
 
     try:
         _reset_environment_for_episode(env, env_cfg, int(spec["episode_seed"]))
+        _set_lerobot_trace_path(action_provider, str(spec.get("vla_trace_path", "")))
         _reset_lerobot_runtime_seed(action_provider, int(spec["episode_seed"]))
         _notify_action_provider_env_reset(action_provider)
         controller.start()
 
         if recorders:
-            _update_third_person_camera_pose(env, args_cli)
             env.sim.render()
             _record_episode_video_frames(env, recorders)
 
         while simulation_app.is_running() and controller.is_running:
-            if recorders:
-                _update_third_person_camera_pose(env, args_cli)
             controller.step()
             step_idx += 1
 

@@ -39,6 +39,15 @@ YAML 均位于 `tasks/common_test_config/base_test/`。包装脚本会选择 YAM
 默认 `SONIC_RAW107_BODY_SOURCE=native_decoder`，即用 64D `motion_token` 和实时本体反馈产生
 29D body target；左右手 7+7D 连续目标直接写入 Dex3。`direct_raw` 只用于动作映射消融。
 
+`SONIC_RAW107_HAND_MODE=policy`（默认）执行 checkpoint 的左右手 7+7D 输出；设为 `open` 时仍做
+完整 107D 推理并保持 body/motion-token 路径不变，但执行端丢弃最后 14D，用 Dex3 标准 open pose
+覆盖双手。该选项用于手部输出消融，不应在同一结果目录中混用两种模式。
+
+`ACT_NEW107_EXECUTE_STEPS` 控制每个 25 步预测 chunk 实际执行的前缀长度，范围为 1–25，默认 25。
+例如设为 5 时，server 的 ACT action queue 每 5 个控制周期耗尽并重新预测，同时每个控制周期仍会
+更新模型的 10 帧状态历史。`SONIC_RAW107_SMOOTH_ALPHA` 对 `direct_raw` 转换后的 29D 关节目标应用
+EMA：`smoothed = alpha * current + (1-alpha) * previous`；默认 1.0（关闭），推荐先以 0.2 做稳定性测试。
+
 已用本目录 contract 验证的示例 checkpoint：
 
 ```text
@@ -77,6 +86,9 @@ wait
 - `ENV_CONFIG_YAML=...`：映射场景；`TASK_NAME` 通常由 YAML 自动读取。手动覆盖时必须保证二者一致。
 - `SERVER_PORT=auto`：默认自动选端口；可用 `SERVER_PORT_BASE/MAX` 调整范围。
 - `DRY_RUN=1`：只做模型发现、contract 和参数预检，不启动评测。
+- `SONIC_RAW107_HAND_MODE=policy|open`：执行模型手部输出，或固定双手为标准张开姿态。
+- `ACT_NEW107_EXECUTE_STEPS=1..25`：每次预测 25 步，但只执行指定前缀后重新预测。
+- `SONIC_RAW107_SMOOTH_ALPHA=(0,1]`：`direct_raw` 关节目标 EMA 系数，数值越小越平滑、滞后越大。
 
 若 server 导入了错误的 LeRobot 源码，显式覆盖训练 fork：
 
@@ -100,4 +112,3 @@ bash isaaclab_twist2_g1/script/eval_scripts/act_new107/HOI_double_desk_run_vla_e
 - ACT 的 10 帧历史和 25 步原生 action queue 属于该接口时序。跨策略比较时必须同时报告输入历史、
   action chunk/执行长度、图像预处理、`MAX_STEPS`、seed、重复次数和视觉随机化配置。
 - checkpoint、YAML/task 映射和成功判定必须匹配；不能根据评测结果为单一模型调整场景或控制参数。
-

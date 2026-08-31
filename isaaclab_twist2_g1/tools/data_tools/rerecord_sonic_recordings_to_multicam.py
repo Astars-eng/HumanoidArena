@@ -458,11 +458,13 @@ def build_jobs(args: argparse.Namespace) -> list[dict[str, object]]:
         manifest_path = output_root / "rerecord_manifest.jsonl"
         completed_sources = set() if args.force else read_successful_sources(manifest_path)
         for source_file in sorted(source_root.rglob("*.npz")):
-            source_file = source_file.resolve()
+            # Keep the path under source_root so staged symlinks remain
+            # addressable relative to that root when allocating outputs.
+            source_file = source_file.absolute()
             if source_file.name.endswith("_temp.npz"):
                 print(f"[skip] ignoring temporary source file: {source_file}")
                 continue
-            if not args.force and str(source_file) in completed_sources:
+            if not args.force and str(source_file.resolve()) in completed_sources:
                 continue
             try:
                 schema_version, task_name = read_npz_meta(source_file)

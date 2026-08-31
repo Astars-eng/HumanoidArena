@@ -70,6 +70,10 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 - `GPU_ID`：模型 server 的物理 GPU；`ISAAC_GPU_ID`：Isaac Sim 的物理 GPU。
 - `SERVER_PORT=auto`、`SERVER_PORT_BASE/MAX`、`MAX_STEPS`、`PERSISTENT_SIM`、`DRY_RUN=1`。
 - `SERVER_DISABLE_ACTION_DELTA_REFINER=1`：旁路 delta refiner，仅用于明确标注的消融。
+- `SERVER_STREAM_EXECUTION_HORIZON=5`：每次预测后实际执行的 action steps，范围为 `1..chunk_size`。
+- `SERVER_NUM_INFERENCE_STEPS=10`：Stream flow matching 推理使用的解噪步数，必须为正整数。
+- `SERVER_ACTION_DELTA_REFINER_WEIGHT=1.0`：执行 `base + weight * refiner_delta`；`0` 为 base action，`1` 为 checkpoint 原始 refiner 输出。
+- `SERVER_ZERO_INFERENCE_NOISE=1`：将 Stream 推理的初始 action noise 设为全零；默认仍为标准高斯采样。
 - `SONIC_RAW_STATE_JOINT_ORDER=mujoco`：当前 29D contract 的默认关节顺序，不应随意覆盖。
 
 ## 双视角录像
@@ -77,20 +81,16 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 每个被 `RECORD_VIDEO_EVERY_N` 选中的 episode 会同时保存两个视频：
 
 - `videos/{success,failure}/<episode>__<result>.mp4`：原有机器人前置相机画面，用于核对模型视觉输入。
-- `videos/world_camera/{success,failure}/<episode>__third_person__<result>.mp4`：自动跟随机器人朝向的后侧三分之四视角，用于完整分析全身动作。
+- `videos/world_camera/{success,failure}/<episode>__third_person__<result>.mp4`：使用各任务 scene 配置的固定世界相机，不随机器人平移或旋转。
 
 第一视角沿用原有 `videos/success` 和 `videos/failure` 目录；转换后的第三视角统一放在
 `videos/world_camera/` 下，并继续按 `success`、`failure` 分类。episode JSON、`summary.jsonl` 和
 `summary.csv` 分别通过 `front_video_path` 与 `third_person_video_path` 记录路径；只有两路均成功保存时
 `dual_video_recorded=true`。所有通过本目录串行、并行或持久仿真入口运行的任务和模型共享该录像逻辑。
 
-第三视角默认输出 1280×720，可按任务需要调整：
+第三视角的位置和朝向由各任务的 `world_camera` scene 配置决定；`stream_29d` 只统一录像分辨率，默认输出 1280×720：
 
 ```bash
-THIRD_PERSON_CAMERA_DISTANCE=4.0 \
-THIRD_PERSON_CAMERA_HEIGHT=2.2 \
-THIRD_PERSON_CAMERA_TARGET_HEIGHT=0.9 \
-THIRD_PERSON_CAMERA_LATERAL_OFFSET=1.25 \
 THIRD_PERSON_CAMERA_IMAGE_WIDTH=1280 \
 THIRD_PERSON_CAMERA_IMAGE_HEIGHT=720 \
 bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
@@ -101,19 +101,30 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 ```bash
 SERVER_PYTHON=/root/miniconda3/envs/lerobot_new/bin/python \
 SERVER_LEROBOT_SRC=/DATA/disk0/fym/vla/src \
-SERVER_CHECKPOINT_REF_REMAP="/share/beingm/yuxuan/model/paligemma_model=/DATA/disk0/fym/paligemma_model" \
+SERVER_TOKENIZER_PATH=/DATA/disk0/fym/paligemma_model \
 MODEL_PATH=/path/to/pretrained_model GPU_ID=0 ISAAC_GPU_ID=1 \
 bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 ```
+
+入口会把已知的两种训练机 PaliGemma tokenizer 路径映射到 `SERVER_TOKENIZER_PATH`。如还需添加
+其他映射，可用分号分隔的 `SERVER_CHECKPOINT_REF_REMAPS="OLD1=NEW1;OLD2=NEW2"`；原有的单条
+`SERVER_CHECKPOINT_REF_REMAP="OLD=NEW"` 仍可作为附加映射。完整 Stream checkpoint 会直接使用自身
+`model.safetensors`，不会因为训练时记录的、当前不可用的 `vlm_pretrained_path` 再加载一遍外部 VLM。
+新训练导出但当前部署 fork 未声明的空 `action_expert_state_keys`/`state_key_dims` 元数据会被安全移除；
+非空值会直接报错，避免静默改变模型输入。checkpoint 中的 `inference_noise_mode` 由运行参数
+`SERVER_ZERO_INFERENCE_NOISE` 显式控制。
+
+SONIC 控制器默认使用 `${SONIC_POLICY_ROOT}/model_encoder.onnx` 和
+`${SONIC_POLICY_ROOT}/model_decoder.onnx`，入口会在启动前校验；需要覆盖时分别设置
+`SONIC_ENCODER_PATH` 和 `SONIC_DECODER_PATH`。
 
 ## 公平性边界
 
 - 不读取物体位姿、奖励、接触、目标状态或成功标签来改变动作。
 - 不添加 IK、轨迹规划、抓取规则、额外平滑或任务专用后处理。
 - DFS/MuJoCo→SONIC 重排和 action scale 是必要机器人接口，必须对所有 29D 模型保持一致。
-- `SERVER_DISABLE_ACTION_DELTA_REFINER`、历史长度、last-action 定义和插值行为必须随结果披露。
+- `SERVER_DISABLE_ACTION_DELTA_REFINER`、`SERVER_NUM_INFERENCE_STEPS`、`SERVER_ZERO_INFERENCE_NOISE`、历史长度、last-action 定义和插值行为必须随结果披露。
 - 本接口没有手部动作能力；在依赖抓取/开门的任务上，不能与 29hand/107D 模型作为同等动作空间
   直接比较。
 - 固定 checkpoint、任务 YAML、`MAX_STEPS`、seed/repeat、随机化和成功判定；多 GPU 拆分不能
   改变完整 seed/repeat 集合。
-

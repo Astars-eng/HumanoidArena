@@ -64,12 +64,14 @@ from action_provider.reset_control import (
 from action_provider.sonic_raw_policy_adapter import (
     SONIC_RAW29_POLICY_ACTION_DIM,
     SONIC_RAW95_POLICY_ACTION_DIM,
+    SONIC_RAW107_HAND_MODES,
     SONIC_RAW_POLICY_ACTION_DIM,
     advance_hand_alpha,
     build_sonic_raw_policy_observation,
     hand_alpha_to_joint_targets,
     reorder_sonic_joint_vector_to_mujoco,
     reorder_mujoco_joint_vector_to_sonic,
+    select_sonic_raw107_hand_targets,
     sonic_raw_body_to_joint_targets,
     split_sonic_raw95_policy_action,
     split_sonic_raw_policy_action,
@@ -1538,6 +1540,9 @@ class SonicActionProvider(ActionProvider):
         self._replay_enabled = bool(self._replay_file)
         self._record_during_replay = bool(getattr(args_cli, "record_during_replay", False))
         self._exit_when_replay_complete = bool(getattr(args_cli, "exit_when_replay_complete", False))
+        self._replay_render_stride = max(
+            1, int(os.environ.get("SONIC_REPLAY_RENDER_STRIDE", "1") or "1")
+        )
         self._input_source = getattr(args_cli, "input_source", "") or ""
         self._gmt_backend = getattr(args_cli, "gmt_backend", "") or ""
         self._use_lerobot_vla = self._input_source == "vla"
@@ -1593,6 +1598,19 @@ class SonicActionProvider(ActionProvider):
             raise ValueError(
                 f"[SonicActionProvider] Unsupported SONIC_RAW107_BODY_SOURCE={self._raw107_body_source!r}; "
                 "expected native_decoder or direct_raw"
+            )
+        self._raw107_hand_mode = str(
+            getattr(
+                args_cli,
+                "sonic_raw107_hand_mode",
+                os.environ.get("SONIC_RAW107_HAND_MODE", "policy"),
+            )
+            or "policy"
+        ).strip().lower()
+        if self._raw107_hand_mode not in SONIC_RAW107_HAND_MODES:
+            raise ValueError(
+                f"[SonicActionProvider] Unsupported SONIC_RAW107_HAND_MODE={self._raw107_hand_mode!r}; "
+                f"expected one of {SONIC_RAW107_HAND_MODES}"
             )
         self._raw_state_joint_order = str(
             getattr(
@@ -1853,6 +1871,8 @@ class SonicActionProvider(ActionProvider):
             self._encoder = None
             self._decoder = None
             print(f"[SonicActionProvider] {self._vla_action_format} body source=direct_raw (audit mode)")
+        if self._use_vla_raw107:
+            print(f"[SonicActionProvider] raw107 hand mode={self._raw107_hand_mode}")
         if (
             self._use_vla_raw29
             or self._use_vla_raw107
@@ -2768,6 +2788,12 @@ class SonicActionProvider(ActionProvider):
         return action
 
     def _should_refresh_lerobot_visuals_next_step(self) -> bool:
+        if self._replay_enabled and self._replay_render_stride > 1:
+            return (
+                self._replay_cursor <= 1
+                or self._replay_cursor >= self._replay_num_frames
+                or self._replay_cursor % self._replay_render_stride == 0
+            )
         return (
             (not self._use_lerobot_vla)
             or self._use_vla_raw107
@@ -2975,8 +3001,14 @@ class SonicActionProvider(ActionProvider):
         split = split_sonic_raw_policy_action(action)
         self._latest_vla_action = action.copy()
         self._latent = split.encoder_token.reshape(1, -1).copy()
-        self._left_hand_target[:] = split.left_hand
-        self._right_hand_target[:] = split.right_hand
+        left_hand, right_hand = select_sonic_raw107_hand_targets(
+            split,
+            mode=self._raw107_hand_mode,
+            left_open_pose=self._get_hand_pose_from_binary("left", False),
+            right_open_pose=self._get_hand_pose_from_binary("right", False),
+        )
+        self._left_hand_target[:] = left_hand
+        self._right_hand_target[:] = right_hand
 
         if self._raw107_body_source == "native_decoder":
             # [control stabilization] Decode the policy's predicted SONIC
@@ -4078,6 +4110,22 @@ class SonicActionProvider(ActionProvider):
         return collect_recordable_env_object_states(self.env, self.env.cfg)
 
     def _collect_vision_state(self) -> dict[str, Any]:
+        # Camera tensors live on the GPU.  Copying them to the host on every
+        # 50 Hz replay step forces a render synchronization even when the
+        # camera itself is intentionally updated at a lower rate.  Reuse the
+        # last host frame between replay render ticks so the output video keeps
+        # the original control-rate timeline without paying that cost 50 times
+        # per second.
+        if self._replay_enabled and self._record_during_replay and self._replay_render_stride > 1:
+            refresh_cache = (
+                self._replay_cursor <= 1
+                or self._replay_cursor >= self._replay_num_frames
+                or self._replay_cursor % self._replay_render_stride == 0
+            )
+            cached_vision = getattr(self, "_recording_vision_cache", None)
+            if not refresh_cache and cached_vision is not None:
+                return cached_vision
+
         vision = {
             "rgb": None,
             "depth": None,
@@ -4118,6 +4166,8 @@ class SonicActionProvider(ActionProvider):
                     vision["right_wrist_depth"] = camera.data.output["distance_to_image_plane"][0].cpu().numpy().copy()
         except Exception:
             return vision
+        if self._replay_enabled and self._record_during_replay:
+            self._recording_vision_cache = vision
         return vision
 
     def _collect_recording_data(
@@ -5918,6 +5968,7 @@ class SonicActionProvider(ActionProvider):
                 if self._waiting_for_reset_complete:
                     return self._default_pos.clone().squeeze(0)
             self._latest_decoder_body_effort = body_effort_preview.copy()
+            t_record0 = time.perf_counter()
             if self._recording_enabled_for_current_mode() and self.recording_manager.is_recording:
                 self.recording_manager.add_frame(
                     self._collect_recording_data(
@@ -5930,6 +5981,7 @@ class SonicActionProvider(ActionProvider):
                     self._reset_complete_received = False
             if self._recording_enabled_for_current_mode():
                 self._update_recording_display_state()
+            t_record1 = time.perf_counter()
 
             # 5. 步进仿真（decimation）
             t_sim0 = time.perf_counter()
@@ -6036,6 +6088,15 @@ class SonicActionProvider(ActionProvider):
 
             t_render1 = time.perf_counter()
             render_ms = (t_render1 - t_render0) * 1000.0
+            replay_timing_every = int(os.environ.get("SONIC_REPLAY_TIMING_EVERY", "0"))
+            if replay_timing_every > 0 and self._frame_count % replay_timing_every == 0:
+                print(
+                    "[SonicActionProvider][REPLAY_TIMING] "
+                    f"frame={self._frame_count} fetch_ms={fetch_ms:.2f} "
+                    f"record_ms={(t_record1 - t_record0) * 1000.0:.2f} "
+                    f"sim_ms={sim_ms:.2f} render_ms={render_ms:.2f} "
+                    f"total_ms={(t_render1 - t_step0) * 1000.0:.2f}"
+                )
             self._perf_render_ms.append(render_ms)
             if len(self._perf_render_ms) > self._perf_buffer_size:
                 self._perf_render_ms.pop(0)
