@@ -150,6 +150,10 @@ def _start_server(args, model_path: str, log_path: Path):
         args.server_host,
         "--port",
         str(args.server_port),
+        "--n-action-steps",
+        str(args.server_n_action_steps),
+        "--num-inference-steps",
+        str(args.server_num_inference_steps),
     ]
     if args.server_lerobot_src:
         cmd.extend(["--lerobot-src", args.server_lerobot_src])
@@ -284,6 +288,10 @@ def _run_episode(
         server_url,
         "--lerobot_server_timeout",
         str(args.lerobot_server_timeout),
+        "--server_n_action_steps",
+        str(args.server_n_action_steps),
+        "--server_num_inference_steps",
+        str(args.server_num_inference_steps),
         "--robot_type",
         args.robot_type,
         "--result_json",
@@ -431,6 +439,10 @@ def _run_episode_batch(
         server_url,
         "--lerobot_server_timeout",
         str(args.lerobot_server_timeout),
+        "--server_n_action_steps",
+        str(args.server_n_action_steps),
+        "--server_num_inference_steps",
+        str(args.server_num_inference_steps),
         "--robot_type",
         args.robot_type,
         "--record_video_every_n",
@@ -776,6 +788,18 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Disable the Stream action delta refiner in the policy server.",
+    )
+    parser.add_argument(
+        "--server_n_action_steps",
+        type=int,
+        default=5,
+        help="Actions consumed from each Stream chunk before server-side replanning.",
+    )
+    parser.add_argument(
+        "--server_num_inference_steps",
+        type=int,
+        default=0,
+        help="Flow Matching denoising steps; 0 keeps the checkpoint value.",
     )
     parser.add_argument("--server_host", type=str, default="127.0.0.1")
     parser.add_argument("--server_port", type=int, default=8443)

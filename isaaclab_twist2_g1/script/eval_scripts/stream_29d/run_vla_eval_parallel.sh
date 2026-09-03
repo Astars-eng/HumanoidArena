@@ -68,6 +68,12 @@ POST_TERMINATION_RECORD_STEPS="${POST_TERMINATION_RECORD_STEPS:-10}"
 RECORD_VIDEO_EVERY_N="${RECORD_VIDEO_EVERY_N:-1}"
 STEP_LOG_EVERY_N="${STEP_LOG_EVERY_N:-100}"
 SIM_VERBOSE_STARTUP="${SIM_VERBOSE_STARTUP:-0}"
+PRE_POLICY_SETTLE_STEPS="${PRE_POLICY_SETTLE_STEPS:-0}"
+if [[ ! "${PRE_POLICY_SETTLE_STEPS}" =~ ^[0-9]+$ ]]; then
+  echo "Error: PRE_POLICY_SETTLE_STEPS must be a non-negative integer, got: ${PRE_POLICY_SETTLE_STEPS}" >&2
+  exit 2
+fi
+export PRE_POLICY_SETTLE_STEPS
 NUM_WORKERS="${NUM_WORKERS:-1}"
 GPU_ID="${GPU_ID:-${SERVER_GPU_IDS:-0}}"
 if [[ ! "${GPU_ID}" =~ ^[0-9]+$ ]]; then
@@ -105,11 +111,25 @@ elif [[ -x "/root/miniconda3/envs/lerobot/bin/python" ]]; then
 fi
 SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
 SERVER_SCRIPT="${SERVER_SCRIPT:-${ISAACLAB_ROOT}/../lerobot/scripts/serve_lerobot_vla_http.py}"
-SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-/DATA/disk0/fym/vla/src}"
-SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-/share/beingm/yuxuan/model/paligemma_model=/DATA/disk0/fym/paligemma_model}"
-SERVER_VERBATIM_TASK="${SERVER_VERBATIM_TASK:-1}"
+SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-/DATA/disk1/fym/vla/src}"
+SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-/share/beingm/yuxuan/model/paligemma_model=/DATA/disk1/fym/paligemma_model}"
+SERVER_VERBATIM_TASK="${SERVER_VERBATIM_TASK:-0}"
 SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE="${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE:-1}"
 SERVER_DISABLE_ACTION_DELTA_REFINER="${SERVER_DISABLE_ACTION_DELTA_REFINER:-0}"
+SERVER_N_ACTION_STEPS="${SERVER_N_ACTION_STEPS:-5}"
+SERVER_NUM_INFERENCE_STEPS="${SERVER_NUM_INFERENCE_STEPS:-0}"
+if [[ ! "${SERVER_N_ACTION_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: SERVER_N_ACTION_STEPS must be a positive integer, got: ${SERVER_N_ACTION_STEPS}" >&2
+  exit 2
+fi
+if [[ ! "${SERVER_NUM_INFERENCE_STEPS}" =~ ^[0-9]+$ ]]; then
+  echo "Error: SERVER_NUM_INFERENCE_STEPS must be a non-negative integer, got: ${SERVER_NUM_INFERENCE_STEPS}" >&2
+  exit 2
+fi
+if [[ "${SERVER_VERBATIM_TASK}" != "0" && "${SERVER_VERBATIM_TASK}" != "1" ]]; then
+  echo "Error: SERVER_VERBATIM_TASK must be 0 (mapped text) or 1 (verbatim), got: ${SERVER_VERBATIM_TASK}" >&2
+  exit 2
+fi
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" != "0" && "${SERVER_DISABLE_ACTION_DELTA_REFINER}" != "1" ]]; then
   echo "Error: SERVER_DISABLE_ACTION_DELTA_REFINER must be 0 or 1, got: ${SERVER_DISABLE_ACTION_DELTA_REFINER}" >&2
   exit 2
@@ -255,12 +275,15 @@ echo "Task: ${TASK_NAME}"
 echo "Result task label: ${TASK_RESULT_NAME}"
 echo "Server task mode: $([[ "${SERVER_VERBATIM_TASK}" == "1" ]] && printf verbatim || printf mapped)"
 echo "Action delta refiner: $([[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]] && printf disabled || printf enabled)"
+echo "Server Stream execution horizon: ${SERVER_N_ACTION_STEPS} action step(s) per chunk"
+echo "Flow Matching inference steps: ${SERVER_NUM_INFERENCE_STEPS} (0 means checkpoint default)"
 echo "GPU: physical ${GPU_ID}; server=${SERVER_DEVICE} with CUDA_VISIBLE_DEVICES=${GPU_ID}"
 echo "Isaac device: ${ISAAC_DEVICE}"
 echo "Server Python: ${SERVER_PYTHON}"
 echo "Server port: mode=${SERVER_PORT_MODE} range=${SERVER_PORT_BASE}-${SERVER_PORT_MAX}"
 echo "Results dir: ${RESULTS_DIR}"
 echo "Raw observation joint order: ${SONIC_RAW_STATE_JOINT_ORDER}"
+echo "Pre-policy settling: ${PRE_POLICY_SETTLE_STEPS} physics step(s), robot pinned"
 if [[ -d "${RESULTS_DIR}/episodes" ]]; then
   echo "Resume mode: reuse existing results in ${RESULTS_DIR}"
 fi
@@ -292,6 +315,8 @@ ARGS=(
   --server_script "${SERVER_SCRIPT}"
   --server_lerobot_src "${SERVER_LEROBOT_SRC}"
   --server_device "${SERVER_DEVICE}"
+  --server_n_action_steps "${SERVER_N_ACTION_STEPS}"
+  --server_num_inference_steps "${SERVER_NUM_INFERENCE_STEPS}"
   --server_gpu_ids "${SERVER_GPU_IDS}"
   --server_host "${SERVER_HOST}"
   --server_scheme "${SERVER_SCHEME}"

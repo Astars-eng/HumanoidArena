@@ -485,6 +485,8 @@ def _load_policy(
     device_name: str,
     *,
     disable_action_delta_refiner: bool = False,
+    n_action_steps: int = 5,
+    num_inference_steps: int = 0,
 ):
     lerobot_src_override = os.environ.get("LEROBOT_VLA_SRC", "").strip()
     lerobot_src = (
@@ -519,7 +521,28 @@ def _load_policy(
     config.device = device_name
 
     if getattr(config, "type", None) == "stream":
-      config.n_action_steps = 5
+        requested_steps = int(n_action_steps)
+        chunk_size = int(getattr(config, "chunk_size", 0) or 0)
+        if requested_steps <= 0:
+            raise ValueError(f"--n-action-steps must be >= 1, got {requested_steps}")
+        if chunk_size > 0 and requested_steps > chunk_size:
+            raise ValueError(
+                f"--n-action-steps ({requested_steps}) cannot exceed checkpoint chunk_size ({chunk_size})"
+            )
+        config.n_action_steps = requested_steps
+        requested_inference_steps = int(num_inference_steps)
+        if requested_inference_steps < 0:
+            raise ValueError(
+                f"--num-inference-steps must be >= 0, got {requested_inference_steps}"
+            )
+        if requested_inference_steps > 0:
+            config.num_inference_steps = requested_inference_steps
+        print(
+            f"[lerobot_vla_server] Stream execution horizon n_action_steps={requested_steps} "
+            f"checkpoint_chunk_size={chunk_size} "
+            f"num_inference_steps={int(config.num_inference_steps)}",
+            flush=True,
+        )
 
     policy_cls = get_policy_class(config.type)
 
@@ -557,6 +580,8 @@ class LeRobotServerState:
         verbatim_task: bool = False,
         stretch_image_to_policy_shape: bool = False,
         disable_action_delta_refiner: bool = False,
+        n_action_steps: int = 5,
+        num_inference_steps: int = 0,
     ):
         (
             self.config,
@@ -570,6 +595,8 @@ class LeRobotServerState:
             policy_dir,
             device_name,
             disable_action_delta_refiner=disable_action_delta_refiner,
+            n_action_steps=n_action_steps,
+            num_inference_steps=num_inference_steps,
         )
         self.expected_state_shape = _feature_shape_dim(self.config.input_features.get("observation.state"))
         self.expected_action_shape = _feature_shape_dim(self.config.output_features.get("action"))
@@ -1114,6 +1141,18 @@ def main():
         action="store_true",
         help="Disable the Stream action delta refiner and run the base Action Expert only.",
     )
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=5,
+        help="Number of actions consumed from each Stream chunk before replanning (default: 5).",
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=0,
+        help="Flow Matching denoising steps; 0 keeps the checkpoint value.",
+    )
     args = parser.parse_args()
 
     if args.lerobot_src:
@@ -1143,6 +1182,8 @@ def main():
             verbatim_task=args.verbatim_task,
             stretch_image_to_policy_shape=args.stretch_image_to_policy_shape,
             disable_action_delta_refiner=args.disable_action_delta_refiner,
+            n_action_steps=args.n_action_steps,
+            num_inference_steps=args.num_inference_steps,
         )
         server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 

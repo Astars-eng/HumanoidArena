@@ -69,8 +69,16 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 - `SEEDS_OVERRIDE="0 1 2"`、`REPEATS_PER_SEED=N`；`run_vla_eval.sh` 也接受 `EVAL_SEEDS`。
 - `GPU_ID`：模型 server 的物理 GPU；`ISAAC_GPU_ID`：Isaac Sim 的物理 GPU。
 - `SERVER_PORT=auto`、`SERVER_PORT_BASE/MAX`、`MAX_STEPS`、`PERSISTENT_SIM`、`DRY_RUN=1`。
+- `SERVER_VERBATIM_TASK=0`（默认）：把 YAML 中的任务名转换成 server 维护的自然语言 instruction；
+  只有 checkpoint 明确按原始 task string 训练时才设置 `SERVER_VERBATIM_TASK=1`。
 - `SERVER_DISABLE_ACTION_DELTA_REFINER=1`：旁路 delta refiner，仅用于明确标注的消融。
+- `SERVER_N_ACTION_STEPS=N`：每个 Stream chunk 实际执行前 `N` 步后用最新观测重新推理；默认
+  `5`，且必须满足 `1 <= N <= checkpoint chunk_size`。
+- `SERVER_NUM_INFERENCE_STEPS=N`：覆盖 Stream Flow Matching 的解噪步数；正整数表示显式覆盖，
+  `0` 保留 checkpoint 中的配置值。该值会写入 run、parallel 和 episode 结果 JSON。
 - `SONIC_RAW_STATE_JOINT_ORDER=mujoco`：当前 29D contract 的默认关节顺序，不应随意覆盖。
+- `PRE_POLICY_SETTLE_STEPS=N`：每局 reset 后固定机器人并仅推进 `N` 个 PhysX 步，待动态物体
+  沉降后再清空 VLA 历史、录制第一帧并开始正式计步；默认 `0`（关闭）。
 
 训练 fork 或 checkpoint 固化引用路径不匹配时：
 
@@ -93,3 +101,31 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 - 固定 checkpoint、任务 YAML、`MAX_STEPS`、seed/repeat、随机化和成功判定；多 GPU 拆分不能
   改变完整 seed/repeat 集合。
 
+## 通用 Grid Search
+
+`eval_grid.py` 用 JSON 描述任务入口、任意数量的 sweep 轴、环境变量映射、seed/repeat 和
+server/Isaac GPU 配对，不依赖任务名或结果目录命名规则。每个轴的 `name` 会成为 manifest 和
+`grid_summary.csv` 的列；`env` 指定传给现有评测入口的环境变量，`value_map` 和
+`value_template` 可用于布尔开关及 checkpoint 路径等转换。
+
+OpenDoor 原有矩阵已迁移为示例配置：
+
+```bash
+GRID=isaaclab_twist2_g1/script/eval_scripts/stream_29d/eval_grid.py
+CONFIG=isaaclab_twist2_g1/script/eval_scripts/stream_29d/grid_configs/open_door_stream29d.json
+
+# 只生成 manifest，或预览 tmux worker 命令，不启动评测
+python3 "$GRID" manifest --config "$CONFIG"
+python3 "$GRID" launch --config "$CONFIG" --dry-run
+
+# 启动矩阵、查看进度汇总
+python3 "$GRID" launch --config "$CONFIG"
+python3 "$GRID" summarize --config "$CONFIG"
+```
+
+复用其他任务时复制该 JSON，只需修改 `name`、`launcher`、`results_root` 和 `axes`。例如增加
+noise/refiner/task 等维度，只需增加 axis；无需修改 launcher 或 summarizer。`variables` 是可由
+同名环境变量覆盖的默认值，因此 checkpoint 根目录等机器相关路径无需复制多份配置。
+
+兼容入口 `run_opendoor_grid_search.sh` 仍可使用；`REFINER_MODE=on/off` 会分别选择对应结果目录
+和 refiner 开关。

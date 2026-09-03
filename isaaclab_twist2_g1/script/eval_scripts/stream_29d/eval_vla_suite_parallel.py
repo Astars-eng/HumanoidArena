@@ -5,6 +5,7 @@ import collections
 import concurrent.futures
 import fcntl
 import json
+import os
 import socket
 import time
 from pathlib import Path
@@ -464,6 +465,8 @@ def main() -> int:
     parser.add_argument('--server_verbatim_task', action='store_true', default=False)
     parser.add_argument('--server_stretch_image_to_policy_shape', action='store_true', default=False)
     parser.add_argument('--server_disable_action_delta_refiner', action='store_true', default=False)
+    parser.add_argument('--server_n_action_steps', type=int, default=5)
+    parser.add_argument('--server_num_inference_steps', type=int, default=0)
     parser.add_argument('--server_host', type=str, default='127.0.0.1')
     parser.add_argument('--server_scheme', type=str, default='http', choices=['http', 'https'])
     parser.add_argument('--tls_cert_file', type=str, default='')
@@ -499,6 +502,27 @@ def main() -> int:
     run_dir = Path(args.results_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     run_lock_fp = _acquire_exclusive_lock(run_dir / '.eval.lock', f"results directory {run_dir}")
+
+    run_config = {
+        'task': args.task,
+        'env_config_yaml': args.env_config_yaml,
+        'model_paths': [str(path) for path in args.model_paths],
+        'seeds': [int(seed) for seed in args.seeds],
+        'repeats_per_seed': int(args.repeats_per_seed),
+        'max_steps': int(args.max_steps),
+        'persistent_sim': bool(args.persistent_sim),
+        'server_task_mode': 'verbatim' if args.server_verbatim_task else 'mapped',
+        'server_verbatim_task': bool(args.server_verbatim_task),
+        'server_n_action_steps': int(args.server_n_action_steps),
+        'server_num_inference_steps': int(args.server_num_inference_steps),
+        'server_disable_action_delta_refiner': bool(args.server_disable_action_delta_refiner),
+        'pre_policy_settle_steps': int(os.environ.get('PRE_POLICY_SETTLE_STEPS', '0') or 0),
+        'server_devices': _resolve_server_devices(args),
+        'isaac_device': str(args.isaac_device),
+    }
+    (run_dir / 'run_config.json').write_text(
+        json.dumps(run_config, ensure_ascii=True, indent=2) + '\n'
+    )
 
     all_jobs, _ = _build_jobs(args)
     if not all_jobs:
@@ -676,6 +700,8 @@ def main() -> int:
         'env_config_yaml': args.env_config_yaml,
         'server_task_mode': 'verbatim' if args.server_verbatim_task else 'mapped',
         'server_verbatim_task': bool(args.server_verbatim_task),
+        'server_n_action_steps': int(args.server_n_action_steps),
+        'server_num_inference_steps': int(args.server_num_inference_steps),
         'server_disable_action_delta_refiner': bool(args.server_disable_action_delta_refiner),
         'total_jobs': len(all_jobs),
         'completed_results': len(results),

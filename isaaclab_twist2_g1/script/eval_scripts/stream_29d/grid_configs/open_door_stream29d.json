@@ -1,0 +1,44 @@
+{
+  "schema_version": "humanoidarena.eval_grid/v1",
+  "name": "HSI_open_door_stream29d",
+  "launcher": "isaaclab_twist2_g1/script/eval_scripts/stream_29d/HSI_open_door_run_vla_eval_parallel.sh",
+  "results_root": "../eval_results_grid_opendoor_refiner_{REFINER_MODE}",
+  "session_name": "opendoor_stream29d_grid_{REFINER_MODE}",
+  "variables": {
+    "CHECKPOINT_ROOT": "/DATA/disk1/fym/vla/outputs/finetune_stream_humanoidarena_sonic_new_multisource_29d_20260815_153724/checkpoints",
+    "REFINER_MODE": "off",
+    "DISABLE_REFINER": "1"
+  },
+  "axes": [
+    {
+      "name": "checkpoint",
+      "values": ["070000", "080000", "100000", "120000", "160000"],
+      "env": "MODEL_PATH",
+      "value_template": "{CHECKPOINT_ROOT}/{value}/pretrained_model",
+      "label_template": "ckpt{value}"
+    },
+    {
+      "name": "horizon",
+      "values": [1, 2, 3, 4, 5],
+      "env": "SERVER_N_ACTION_STEPS"
+    },
+    {
+      "name": "flow",
+      "values": [5, 10, 20],
+      "env": "SERVER_NUM_INFERENCE_STEPS"
+    }
+  ],
+  "fixed_env": {
+    "SERVER_DISABLE_ACTION_DELTA_REFINER": "{DISABLE_REFINER}",
+    "SERVER_VERBATIM_TASK": "0",
+    "PRE_POLICY_SETTLE_STEPS": "0"
+  },
+  "seeds": "0 1 2",
+  "repeats_per_seed": 20,
+  "workers": [
+    {"server_gpu": 0, "isaac_gpu": 1},
+    {"server_gpu": 2, "isaac_gpu": 3},
+    {"server_gpu": 4, "isaac_gpu": 5},
+    {"server_gpu": 6, "isaac_gpu": 7}
+  ]
+}

@@ -85,6 +85,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lerobot_server_url", type=str, required=True)
     parser.add_argument("--lerobot_server_timeout", type=float, default=5.0)
     parser.add_argument("--lerobot_server_verify_ssl", action="store_true", default=False)
+    parser.add_argument("--server_n_action_steps", type=int, default=5)
+    parser.add_argument("--server_num_inference_steps", type=int, default=0)
     parser.add_argument("--lerobot_gripper_threshold", type=float, default=0.5)
     parser.add_argument(
         "--sonic_vla_action_format",
@@ -114,6 +116,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record_video_every_n", type=int, default=1)
     parser.add_argument("--step_log_every_n", type=int, default=0)
     parser.add_argument("--verbose_startup", action="store_true", default=False)
+    parser.add_argument(
+        "--pre_policy_settle_steps",
+        type=int,
+        default=int(os.environ.get("PRE_POLICY_SETTLE_STEPS", "0") or 0),
+        help=(
+            "Physics-only settling steps after each episode reset. The robot root and joints are "
+            "pinned to their reset state, and VLA inference/recording starts only after settling."
+        ),
+    )
     parser.add_argument("--disable_fall_detection", action="store_true", default=False)
     parser.add_argument("--fall_tilt_deg", type=float, default=60.0)
     parser.add_argument("--fall_hard_tilt_deg", type=float, default=75.0)
@@ -619,6 +630,42 @@ def _reset_lerobot_runtime_seed(action_provider, episode_seed: int):
         client.reset(seed=int(episode_seed))
 
 
+def _settle_scene_with_robot_pinned(env, settle_steps: int) -> None:
+    """Advance dynamic scene objects while keeping the robot at its reset state."""
+    steps = int(settle_steps)
+    if steps <= 0:
+        return
+
+    robot = env.scene["robot"]
+    root_state = robot.data.root_state_w.detach().clone()
+    root_pose = root_state[:, :7].clone()
+    zero_root_velocity = torch.zeros_like(root_state[:, 7:13])
+    joint_pos = robot.data.joint_pos.detach().clone()
+    zero_joint_velocity = torch.zeros_like(robot.data.joint_vel)
+
+    print(
+        f"[sim_eval_vla] pre-policy settling start physics_steps={steps} "
+        f"duration_sec={steps * float(env.physics_dt):.3f} robot_pinned=1"
+    )
+    for _ in range(steps):
+        robot.write_root_pose_to_sim(root_pose)
+        robot.write_root_velocity_to_sim(zero_root_velocity)
+        robot.write_joint_state_to_sim(joint_pos, zero_joint_velocity)
+        env.scene.write_data_to_sim()
+        env.sim.step(render=False)
+        env.scene.update(dt=env.physics_dt)
+
+    # The last physics step can integrate the floating base once. Restore the exact
+    # episode reset state without resetting scene objects that have just settled.
+    robot.write_root_pose_to_sim(root_pose)
+    robot.write_root_velocity_to_sim(zero_root_velocity)
+    robot.write_joint_state_to_sim(joint_pos, zero_joint_velocity)
+    env.scene.write_data_to_sim()
+    env.scene.update(dt=0.0)
+    env.sim.render()
+    print("[sim_eval_vla] pre-policy settling complete; robot state restored")
+
+
 
 def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: str, *, success: bool, failure_reason: str, step_idx: int, terminal_step_idx: int, final_reward: float, final_reward_scaled: float, max_reward: float, max_reward_scaled: float, video_path: str, started_at: float, error: str = "", terminal_detail: str = "", env=None) -> dict:
     from common_env_objects import get_current_episode_object_seed_info
@@ -645,6 +692,9 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "sonic_vla_action_format": str(args_cli.sonic_vla_action_format),
         "sonic_raw107_body_source": str(args_cli.sonic_raw107_body_source),
         "sonic_raw_state_joint_order": str(args_cli.sonic_raw_state_joint_order),
+        "pre_policy_settle_steps": int(args_cli.pre_policy_settle_steps),
+        "server_n_action_steps": int(args_cli.server_n_action_steps),
+        "server_num_inference_steps": int(args_cli.server_num_inference_steps),
         "started_at": started_at,
         "finished_at": time.time(),
         "duration_sec": time.time() - started_at,
@@ -692,6 +742,9 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
 
     try:
         _reset_environment_for_episode(env, env_cfg, int(spec["episode_seed"]))
+        _settle_scene_with_robot_pinned(env, int(args_cli.pre_policy_settle_steps))
+        # Reset policy-side histories only after settling so no settling frame or
+        # provisional action can leak into the evaluated episode.
         _reset_lerobot_runtime_seed(action_provider, int(spec["episode_seed"]))
         _notify_action_provider_env_reset(action_provider)
         controller.start()
