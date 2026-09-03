@@ -15,8 +15,11 @@ FRONT_CAMERA_WIDTH = 640
 FRONT_CAMERA_HEIGHT = 480
 WRIST_CAMERA_WIDTH = 640
 WRIST_CAMERA_HEIGHT = 480
-WORLD_CAMERA_WIDTH = 1920
-WORLD_CAMERA_HEIGHT = 1080
+WORLD_CAMERA_WIDTH = int(os.environ.get("HUMANOIDARENA_WORLD_CAMERA_WIDTH", "1920"))
+WORLD_CAMERA_HEIGHT = int(os.environ.get("HUMANOIDARENA_WORLD_CAMERA_HEIGHT", "1080"))
+WORLD_CAMERA_UPDATE_PERIOD = float(
+    os.environ.get("HUMANOIDARENA_WORLD_CAMERA_UPDATE_PERIOD", "0.01")
+)
 
 
 def _depth_enabled_from_env() -> bool:
@@ -93,7 +96,7 @@ class CameraBaseCfg:
     @classmethod
     def get_world_camera_config(
         cls,
-        update_period: float = 0.01,
+        update_period: float = WORLD_CAMERA_UPDATE_PERIOD,
         height: int = WORLD_CAMERA_HEIGHT,
         width: int = WORLD_CAMERA_WIDTH,
         focal_length: float = 12,

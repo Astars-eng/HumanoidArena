@@ -704,7 +704,9 @@ def _write_summary(run_dir: Path, results: list[dict]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Non-parallel merged ACT/DP/flow-matching raw107 evaluation suite")
+    parser = argparse.ArgumentParser(
+        description="Non-parallel merged ACT/DP/flow-matching/PI0.5 raw107 evaluation suite"
+    )
     parser.add_argument("--task", type=str, default=TASK_DOUBLE_DESK)
     parser.add_argument("--policy_task", type=str, required=True)
     parser.add_argument("--env_config_yaml", type=str, default="tasks/common_test_config/base_test/doubledesk_sonic_test.yaml")

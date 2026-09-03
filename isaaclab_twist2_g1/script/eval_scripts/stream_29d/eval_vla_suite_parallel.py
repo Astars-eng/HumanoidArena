@@ -5,7 +5,7 @@ import collections
 import concurrent.futures
 import fcntl
 import json
-import os
+import math
 import socket
 import time
 from pathlib import Path
@@ -287,6 +287,9 @@ def _build_failure_result(args, server_url: str, run_dir: Path, task_spec: dict,
         'max_reward': 0.0,
         'max_reward_scaled': 0.0,
         'video_path': '',
+        'front_video_path': '',
+        'third_person_video_path': '',
+        'dual_video_recorded': False,
         'server_url': server_url,
         'log_path': str(sim_log),
         'returncode': -1,
@@ -423,6 +426,8 @@ def main() -> int:
     parser.add_argument('--video_fps', type=int, default=30)
     parser.add_argument('--post_termination_record_steps', type=int, default=0)
     parser.add_argument('--record_video_every_n', type=int, default=1)
+    parser.add_argument('--third_person_camera_image_width', type=int, default=1280)
+    parser.add_argument('--third_person_camera_image_height', type=int, default=720)
     parser.add_argument('--step_log_every_n', type=int, default=0)
     parser.add_argument('--verbose_startup', action='store_true', default=False)
     parser.add_argument('--robot_type', type=str, default='unitree_g1_refpose_v3_1')
@@ -465,8 +470,10 @@ def main() -> int:
     parser.add_argument('--server_verbatim_task', action='store_true', default=False)
     parser.add_argument('--server_stretch_image_to_policy_shape', action='store_true', default=False)
     parser.add_argument('--server_disable_action_delta_refiner', action='store_true', default=False)
-    parser.add_argument('--server_n_action_steps', type=int, default=5)
-    parser.add_argument('--server_num_inference_steps', type=int, default=0)
+    parser.add_argument('--server_stream_execution_horizon', type=int, default=5)
+    parser.add_argument('--server_action_delta_refiner_weight', type=float, default=1.0)
+    parser.add_argument('--server_num_inference_steps', type=int, default=10)
+    parser.add_argument('--server_zero_inference_noise', action='store_true', default=False)
     parser.add_argument('--server_host', type=str, default='127.0.0.1')
     parser.add_argument('--server_scheme', type=str, default='http', choices=['http', 'https'])
     parser.add_argument('--tls_cert_file', type=str, default='')
@@ -486,6 +493,22 @@ def main() -> int:
         help='Allow the Stream server and Isaac Sim to share one GPU (likely to OOM for float32 Stream).',
     )
     args = parser.parse_args()
+    if args.server_stream_execution_horizon <= 0:
+        parser.error('--server_stream_execution_horizon must be a positive integer')
+    if args.server_num_inference_steps <= 0:
+        parser.error('--server_num_inference_steps must be a positive integer')
+    if (
+        not math.isfinite(args.server_action_delta_refiner_weight)
+        or args.server_action_delta_refiner_weight < 0
+    ):
+        parser.error('--server_action_delta_refiner_weight must be finite and non-negative')
+    if args.server_disable_action_delta_refiner and not math.isclose(
+        args.server_action_delta_refiner_weight, 1.0
+    ):
+        parser.error(
+            '--server_disable_action_delta_refiner cannot be combined with a non-default '
+            '--server_action_delta_refiner_weight'
+        )
 
     if args.num_workers <= 0:
         raise ValueError('--num_workers must be >= 1')
@@ -513,8 +536,10 @@ def main() -> int:
         'persistent_sim': bool(args.persistent_sim),
         'server_task_mode': 'verbatim' if args.server_verbatim_task else 'mapped',
         'server_verbatim_task': bool(args.server_verbatim_task),
-        'server_n_action_steps': int(args.server_n_action_steps),
+        'server_stream_execution_horizon': int(args.server_stream_execution_horizon),
         'server_num_inference_steps': int(args.server_num_inference_steps),
+        'server_action_delta_refiner_weight': float(args.server_action_delta_refiner_weight),
+        'server_zero_inference_noise': bool(args.server_zero_inference_noise),
         'server_disable_action_delta_refiner': bool(args.server_disable_action_delta_refiner),
         'pre_policy_settle_steps': int(os.environ.get('PRE_POLICY_SETTLE_STEPS', '0') or 0),
         'server_devices': _resolve_server_devices(args),
@@ -700,9 +725,11 @@ def main() -> int:
         'env_config_yaml': args.env_config_yaml,
         'server_task_mode': 'verbatim' if args.server_verbatim_task else 'mapped',
         'server_verbatim_task': bool(args.server_verbatim_task),
-        'server_n_action_steps': int(args.server_n_action_steps),
-        'server_num_inference_steps': int(args.server_num_inference_steps),
         'server_disable_action_delta_refiner': bool(args.server_disable_action_delta_refiner),
+        'server_stream_execution_horizon': int(args.server_stream_execution_horizon),
+        'server_action_delta_refiner_weight': float(args.server_action_delta_refiner_weight),
+        'server_num_inference_steps': int(args.server_num_inference_steps),
+        'server_zero_inference_noise': bool(args.server_zero_inference_noise),
         'total_jobs': len(all_jobs),
         'completed_results': len(results),
         'pending_results': max(0, len(all_jobs) - len(results)),

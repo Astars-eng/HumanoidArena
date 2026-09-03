@@ -20,6 +20,7 @@ if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.io_utils import load_info, load_stats, write_info, write_stats, write_tasks
 
@@ -48,6 +49,8 @@ DERIVED_VECTOR_FEATURES: dict[str, tuple[str, ...]] = {
     ),
 }
 STAT_NAMES = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+QUANTILE_LEVELS = (0.01, 0.10, 0.50, 0.90, 0.99)
+QUANTILE_NAMES = tuple(f"q{int(level * 100):02d}" for level in QUANTILE_LEVELS)
 
 
 @dataclass(frozen=True)
@@ -67,8 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=["all", "sonic", "twist2", "csv"],
-        required=True,
         help="all: merge all 16 datasets; sonic/twist2: merge that family; csv: merge paths from CSV.",
+    )
+    parser.add_argument(
+        "--recompute-stats-only",
+        action="store_true",
+        help="Repair an existing --output-root by recomputing exact tabular stats from its parquet files.",
     )
     parser.add_argument(
         "--datasets-root",
@@ -455,10 +462,133 @@ def scalar_stats(values: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def exact_feature_stats(values: np.ndarray) -> dict[str, np.ndarray]:
+    """Compute exact per-dimension statistics from the pooled raw samples."""
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        raise ValueError(f"Expected a non-empty 2-D feature array, got shape={arr.shape}")
+
+    quantiles = np.quantile(arr, QUANTILE_LEVELS, axis=0)
+    stats = {
+        "min": np.min(arr, axis=0),
+        "max": np.max(arr, axis=0),
+        "mean": np.mean(arr, axis=0, dtype=np.float64),
+        "std": np.std(arr, axis=0, dtype=np.float64),
+        "count": np.array([arr.shape[0]], dtype=np.int64),
+    }
+    stats.update({name: quantiles[index] for index, name in enumerate(QUANTILE_NAMES)})
+    return stats
+
+
+def _stack_parquet_feature(series: pd.Series, key: str, expected_dim: int) -> np.ndarray:
+    """Convert one parquet feature column into a contiguous [frames, dim] array."""
+    if len(series) == 0:
+        return np.empty((0, expected_dim), dtype=np.float32)
+
+    first = np.asarray(series.iloc[0])
+    if first.ndim == 0:
+        values = series.to_numpy().reshape(-1, 1)
+    else:
+        try:
+            values = np.stack(series.to_numpy())
+        except ValueError as exc:
+            raise ValueError(f"Cannot stack parquet feature {key!r}") from exc
+        values = values.reshape(len(series), -1)
+
+    if values.shape[1] != expected_dim:
+        raise ValueError(
+            f"Parquet feature {key!r} has flattened dimension {values.shape[1]}, expected {expected_dim}"
+        )
+    return np.ascontiguousarray(values)
+
+
+def recompute_tabular_stats(
+    output_root: Path,
+    features: dict[str, dict[str, Any]],
+    total_frames: int,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Recompute exact stats for numeric parquet features in the merged dataset.
+
+    Video/image statistics are deliberately excluded: decoding them is expensive
+    and PI0.5 uses identity normalization for visual inputs. Their aggregated
+    statistics retain the conservative quantile envelope from ``aggregate_stats``.
+    """
+    data_files = sorted((output_root / "data").glob("chunk-*/file-*.parquet"))
+    if not data_files:
+        raise FileNotFoundError(f"No merged parquet files found under {output_root / 'data'}")
+
+    available_columns = set(pq.read_schema(data_files[0]).names)
+    numeric_keys = [
+        key
+        for key, feature in features.items()
+        if key in available_columns and feature.get("dtype") not in {"image", "video", "string"}
+    ]
+
+    recomputed: dict[str, dict[str, np.ndarray]] = {}
+    for key in numeric_keys:
+        print(f"recomputing exact pooled stats: {key}")
+        shape = features[key].get("shape", [1])
+        expected_dim = int(np.prod(shape)) if shape else 1
+        values: np.ndarray | None = None
+        cursor = 0
+
+        for path in data_files:
+            series = pd.read_parquet(path, columns=[key])[key]
+            chunk = _stack_parquet_feature(series, key, expected_dim)
+            if len(chunk) == 0:
+                continue
+            if values is None:
+                values = np.empty((total_frames, expected_dim), dtype=chunk.dtype)
+            next_cursor = cursor + len(chunk)
+            if next_cursor > total_frames:
+                raise ValueError(
+                    f"Feature {key!r} contains more than the declared {total_frames} frames"
+                )
+            values[cursor:next_cursor] = chunk
+            cursor = next_cursor
+
+        if values is None or cursor != total_frames:
+            raise ValueError(
+                f"Feature {key!r} contains {cursor} frames, expected {total_frames}"
+            )
+        recomputed[key] = exact_feature_stats(values)
+
+    return recomputed
+
+
+def repair_merged_stats(output_root: Path) -> None:
+    """Replace tabular stats of an existing merged dataset with exact pooled stats."""
+    output_root = normalize_path(output_root)
+    info = load_info(output_root)
+    stats = load_stats(output_root)
+    if stats is None:
+        raise FileNotFoundError(f"Missing stats file under {output_root / 'meta'}")
+
+    stats_path = output_root / "meta" / "stats.json"
+    backup_path = output_root / "meta" / "stats.before_exact_recompute.json"
+    if not backup_path.exists():
+        shutil.copy2(stats_path, backup_path)
+
+    stats.update(
+        recompute_tabular_stats(
+            output_root,
+            features=info["features"],
+            total_frames=int(info["total_frames"]),
+        )
+    )
+    write_stats(stats, output_root)
+    print(f"updated stats      : {stats_path}")
+    print(f"original backup   : {backup_path}")
+
+
 def update_stats(
     output_root: Path,
     sources: list[SourceDataset],
     scalar_columns: dict[str, list[np.ndarray]],
+    features: dict[str, dict[str, Any]],
+    total_frames: int,
 ) -> None:
     source_stats = [load_stats(source.path) for source in sources]
     if any(stats is None for stats in source_stats):
@@ -471,6 +601,12 @@ def update_stats(
 
     for output_key, source_keys in DERIVED_VECTOR_FEATURES.items():
         merged_stats[output_key] = concatenate_stats(merged_stats, output_key, source_keys)
+
+    # The aggregation above is exact for min/max/mean/std, but quantiles cannot
+    # be recovered from per-source summaries.  Scan the merged raw parquet data
+    # so every numeric feature, especially PI0.5 state/action, gets true global
+    # quantiles rather than an average of task-level quantiles.
+    merged_stats.update(recompute_tabular_stats(output_root, features, total_frames))
 
     write_stats(merged_stats, output_root)
 
@@ -628,7 +764,13 @@ def merge_datasets(
 
     write_tasks(task_df, output_root)
     write_info(info, output_root)
-    update_stats(output_root, sources, scalar_columns)
+    update_stats(
+        output_root,
+        sources,
+        scalar_columns,
+        features=info["features"],
+        total_frames=int(frame_offset),
+    )
 
     manifest = {
         "repo_id": repo_id,
@@ -685,6 +827,14 @@ def print_plan(sources: list[SourceDataset], output_root: Path, repo_id: str, vi
 
 def main() -> None:
     args = parse_args()
+    if args.recompute_stats_only:
+        if args.output_root is None:
+            raise ValueError("--output-root is required with --recompute-stats-only")
+        repair_merged_stats(args.output_root)
+        return
+    if args.mode is None:
+        raise ValueError("--mode is required unless --recompute-stats-only is used")
+
     output_root = default_output_root(args)
     repo_id = args.repo_id or f"{DEFAULT_REPO_PREFIX}/{output_root.name}"
 

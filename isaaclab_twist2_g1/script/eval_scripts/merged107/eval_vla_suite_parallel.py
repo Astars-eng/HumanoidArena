@@ -409,7 +409,9 @@ def _worker_run(task_spec: dict, args_dict: dict, run_dir_str: str) -> list[dict
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Single-GPU merged ACT/DP/flow-matching raw107 evaluation scheduler')
+    parser = argparse.ArgumentParser(
+        description='Single-GPU merged ACT/DP/flow-matching/PI0.5 raw107 evaluation scheduler'
+    )
     parser.add_argument('--task', type=str, default=TASK_DOUBLE_DESK)
     parser.add_argument('--policy_task', type=str, required=True)
     parser.add_argument('--env_config_yaml', type=str, default='tasks/common_test_config/base_test/doubledesk_sonic_test.yaml')

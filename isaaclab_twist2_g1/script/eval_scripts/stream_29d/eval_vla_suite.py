@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -150,10 +151,6 @@ def _start_server(args, model_path: str, log_path: Path):
         args.server_host,
         "--port",
         str(args.server_port),
-        "--n-action-steps",
-        str(args.server_n_action_steps),
-        "--num-inference-steps",
-        str(args.server_num_inference_steps),
     ]
     if args.server_lerobot_src:
         cmd.extend(["--lerobot-src", args.server_lerobot_src])
@@ -165,6 +162,18 @@ def _start_server(args, model_path: str, log_path: Path):
         cmd.append("--stretch-image-to-policy-shape")
     if args.server_disable_action_delta_refiner:
         cmd.append("--disable-action-delta-refiner")
+    cmd.extend(
+        [
+            "--stream-execution-horizon",
+            str(args.server_stream_execution_horizon),
+            "--num-inference-steps",
+            str(args.server_num_inference_steps),
+            "--action-delta-refiner-weight",
+            str(args.server_action_delta_refiner_weight),
+        ]
+    )
+    if args.server_zero_inference_noise:
+        cmd.append("--zero-inference-noise")
     if args.server_scheme == "https":
         if not args.tls_cert_file or not args.tls_key_file:
             raise ValueError("HTTPS server requires --tls_cert_file and --tls_key_file")
@@ -215,6 +224,9 @@ def _load_result_or_fallback(
             "max_reward": 0.0,
             "max_reward_scaled": 0.0,
             "video_path": "",
+            "front_video_path": "",
+            "third_person_video_path": "",
+            "dual_video_recorded": False,
             "server_url": server_url,
             "returncode": returncode,
         }
@@ -288,10 +300,6 @@ def _run_episode(
         server_url,
         "--lerobot_server_timeout",
         str(args.lerobot_server_timeout),
-        "--server_n_action_steps",
-        str(args.server_n_action_steps),
-        "--server_num_inference_steps",
-        str(args.server_num_inference_steps),
         "--robot_type",
         args.robot_type,
         "--result_json",
@@ -306,6 +314,10 @@ def _run_episode(
         str(args.post_termination_record_steps),
         "--record_video_every_n",
         str(args.record_video_every_n),
+        "--third_person_camera_image_width",
+        str(args.third_person_camera_image_width),
+        "--third_person_camera_image_height",
+        str(args.third_person_camera_image_height),
         "--step_log_every_n",
         str(args.step_log_every_n),
         "--episode_index",
@@ -378,13 +390,25 @@ def _run_episode_batch(
     success_video_dir = run_dir / "videos" / "success"
     failure_video_dir = run_dir / "videos" / "failure"
     recordings_dir = run_dir / "recordings"
+    vla_outputs_dir = recordings_dir / "vla_outputs"
     batch_dir = run_dir / "episode_batches"
-    for directory in (episodes_dir, logs_dir, success_video_dir, failure_video_dir, recordings_dir, batch_dir):
+    for directory in (
+        episodes_dir,
+        logs_dir,
+        success_video_dir,
+        failure_video_dir,
+        recordings_dir,
+        vla_outputs_dir,
+        batch_dir,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
 
     batch_entries = []
     for job in jobs:
         episode_stem = _episode_stem(model_label, job["seed"], job["repeat_idx"], job["episode_index"])
+        vla_trace_path = vla_outputs_dir / f"{episode_stem}.jsonl"
+        if vla_trace_path.exists():
+            vla_trace_path.unlink()
         batch_entries.append(
             {
                 "seed": int(job["seed"]),
@@ -395,6 +419,7 @@ def _run_episode_batch(
                 "success_video_dir": str(success_video_dir),
                 "failure_video_dir": str(failure_video_dir),
                 "recording_save_dir": str(recordings_dir),
+                "vla_trace_path": str(vla_trace_path),
                 "model_label": model_label,
                 "eval_model_path": model_path,
                 "max_steps": int(args.max_steps),
@@ -439,14 +464,14 @@ def _run_episode_batch(
         server_url,
         "--lerobot_server_timeout",
         str(args.lerobot_server_timeout),
-        "--server_n_action_steps",
-        str(args.server_n_action_steps),
-        "--server_num_inference_steps",
-        str(args.server_num_inference_steps),
         "--robot_type",
         args.robot_type,
         "--record_video_every_n",
         str(args.record_video_every_n),
+        "--third_person_camera_image_width",
+        str(args.third_person_camera_image_width),
+        "--third_person_camera_image_height",
+        str(args.third_person_camera_image_height),
         "--step_log_every_n",
         str(args.step_log_every_n),
         "--recording_save_dir",
@@ -497,7 +522,7 @@ def _run_episode_batch(
             returncode=completed.returncode,
         )
         result["log_path"] = str(batch_log)
-        result["vla_trace_path"] = ""
+        result["vla_trace_path"] = str(entry["vla_trace_path"])
         results.append(result)
     return results
 
@@ -683,6 +708,9 @@ def _write_summary(run_dir: Path, results: list[dict]) -> None:
         "max_reward",
         "max_reward_scaled",
         "video_path",
+        "front_video_path",
+        "third_person_video_path",
+        "dual_video_recorded",
         "log_path",
         "vla_trace_path",
         "server_url",
@@ -711,6 +739,8 @@ def main() -> int:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--post_termination_record_steps", type=int, default=0)
     parser.add_argument("--record_video_every_n", type=int, default=1)
+    parser.add_argument("--third_person_camera_image_width", type=int, default=1280)
+    parser.add_argument("--third_person_camera_image_height", type=int, default=720)
     parser.add_argument("--step_log_every_n", type=int, default=0)
     parser.add_argument("--verbose_startup", action="store_true", default=False)
     parser.add_argument("--robot_type", type=str, default="unitree_g1_refpose_v3_1")
@@ -790,16 +820,28 @@ def main() -> int:
         help="Disable the Stream action delta refiner in the policy server.",
     )
     parser.add_argument(
-        "--server_n_action_steps",
+        "--server_stream_execution_horizon",
         type=int,
         default=5,
-        help="Actions consumed from each Stream chunk before server-side replanning.",
+        help="Number of Stream actions executed before the server predicts a new chunk.",
+    )
+    parser.add_argument(
+        "--server_action_delta_refiner_weight",
+        type=float,
+        default=1.0,
+        help="Runtime multiplier applied to the Stream Refiner delta.",
     )
     parser.add_argument(
         "--server_num_inference_steps",
         type=int,
-        default=0,
-        help="Flow Matching denoising steps; 0 keeps the checkpoint value.",
+        default=10,
+        help="Number of flow-matching denoising steps used for Stream inference.",
+    )
+    parser.add_argument(
+        "--server_zero_inference_noise",
+        action="store_true",
+        default=False,
+        help="Use an all-zero initial action-noise tensor for Stream inference.",
     )
     parser.add_argument("--server_host", type=str, default="127.0.0.1")
     parser.add_argument("--server_port", type=int, default=8443)
@@ -815,6 +857,22 @@ def main() -> int:
         help="Seconds to allow for loading large VLA checkpoints before the HTTP readiness check fails.",
     )
     args = parser.parse_args()
+    if args.server_stream_execution_horizon <= 0:
+        parser.error("--server_stream_execution_horizon must be a positive integer")
+    if args.server_num_inference_steps <= 0:
+        parser.error("--server_num_inference_steps must be a positive integer")
+    if (
+        not math.isfinite(args.server_action_delta_refiner_weight)
+        or args.server_action_delta_refiner_weight < 0
+    ):
+        parser.error("--server_action_delta_refiner_weight must be finite and non-negative")
+    if args.server_disable_action_delta_refiner and not math.isclose(
+        args.server_action_delta_refiner_weight, 1.0
+    ):
+        parser.error(
+            "--server_disable_action_delta_refiner cannot be combined with a non-default "
+            "--server_action_delta_refiner_weight"
+        )
 
     run_dir = Path(args.results_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)

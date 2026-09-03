@@ -1,6 +1,6 @@
-# merged107：ACT / Diffusion Policy / Flow Matching 统一评测入口
+# merged107：ACT / Diffusion Policy / Flow Matching / PI0.5 统一评测入口
 
-本目录由当前工作区的 `act_new107` 复制并针对七任务混合训练 checkpoint 改造。三类策略共用同一套仿真、SONIC 控制、成功判定、录像和结果汇总逻辑；差异由 checkpoint 的 `config.json` 和保存的 processor 在 LeRobot HTTP server 内部处理。
+本目录由当前工作区的 `act_new107` 复制并针对七任务混合训练 checkpoint 改造。四类策略共用同一套仿真、SONIC 控制、成功判定、录像和结果汇总逻辑；差异由 checkpoint 的 `config.json` 和保存的 processor 在 LeRobot HTTP server 内部处理。
 
 ## 支持的 checkpoint 合约
 
@@ -9,6 +9,7 @@
 | ACT | `type=act` | `n_obs_steps=1`, `chunk_size=20`, `n_action_steps=20` |
 | Diffusion Policy | `type=diffusion` | `n_obs_steps=1`, `horizon=24`, `n_action_steps=20` |
 | Flow Matching | `type=multi_task_dit`, `objective=flow_matching` | `n_obs_steps=1`, `horizon=40`, `n_action_steps=20` |
+| PI0.5 | `type=pi05` | `n_obs_steps=1`, `chunk_size=20`, `n_action_steps=20` |
 
 共同接口为：
 
@@ -17,7 +18,7 @@
 - 动作：`action = [107]`，即 `applied_action[29] + motion_token[64] + left_hand[7] + right_hand[7]`。
 - 关节序：状态和 checkpoint 的 `applied_action` 使用 DFS/MuJoCo 顺序；送入 SONIC 前转换为 SONIC/IsaacLab 顺序。
 
-`raw107_contract.py` 在启动 server 前读取 checkpoint 自身配置并 fail-fast。它不把 ACT、DP 和 Flow Matching 的 horizon/chunk 硬改成同一个值。
+`raw107_contract.py` 在启动 server 前读取 checkpoint 自身配置并 fail-fast。它不把 ACT、DP、Flow Matching 和 PI0.5 的 horizon/chunk 硬改成同一个值。
 
 ## last_action 闭环
 
@@ -44,7 +45,7 @@
 | `HSI_sit_sofa_run_vla_eval_parallel.sh` | Sit on the sofa. |
 | `HSI_vision_navi_run_vla_eval_parallel.sh` | Avoid obstacles and move to the yellow marked area. |
 
-这对 Flow Matching 必须正确；官方发布的 ACT/DP baseline 不包含 tokenizer 或文本编码器，因而不会消费文本，但仍可安全共用入口。server 固定使用 verbatim task，避免把 `football` 改写成训练中没有的 `soccer`。三类模型获得相同的 prompt 字段，但只有 Flow Matching 将其作为模型条件；这与官方发布的三类 baseline 实现一致，并不代表三类架构具有相同的文本条件能力。
+这对 Flow Matching 和 PI0.5 必须正确；官方发布的 ACT/DP baseline 不包含 tokenizer 或文本编码器，因而不会消费文本，但仍可安全共用入口。server 固定使用 verbatim task，避免把 `football` 改写成训练中没有的 `soccer`。四类模型获得相同的 prompt 字段，其中 Flow Matching 和 PI0.5 将其作为模型条件。
 
 ## 论文任务时限
 
@@ -82,6 +83,15 @@ SEEDS_OVERRIDE="0" REPEATS_PER_SEED=1 RECORD_VIDEO_EVERY_N=1 GPU_ID=0 \
 ```text
 /DATA/disk0/fym/vla/outputs/dp_humanoidarena_sonic_merged_act107_0820_fym/checkpoints/100000/pretrained_model
 /DATA/disk0/fym/vla/outputs/fm_humanoidarena_sonic_merged_act107_0820_fym/checkpoints/100000/pretrained_model
+```
+
+PI0.5 merged raw107 checkpoint 也使用同一入口；`MODEL_PATH` 可以指向包含
+`pretrained_model/` 的 checkpoint 目录：
+
+```bash
+MODEL_PATH=/DATA/disk0/fym/vla/outputs/pi05_humanoidarena_sonic_merged_raw107_fsdp_4gpu_100k/checkpoints/100000 \
+SEEDS_OVERRIDE="0" REPEATS_PER_SEED=1 GPU_ID=0 \
+  bash isaaclab_twist2_g1/script/eval_scripts/merged107/HOI_football_run_vla_eval_parallel.sh
 ```
 
 不设置 `MODEL_PATH` / `MODEL_PATHS_CSV` 时，一个 wrapper 会依次评测上述 ACT、DP、Flow Matching 三个默认 checkpoint。正式七任务评测分别运行七个 wrapper；默认 seeds/repeats 来自评测入口，max steps 由各任务 wrapper 按论文 Table S1 设置。建议先 smoke test，再使用完整默认重复数，因为完整评测 episode 数较多。

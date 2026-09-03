@@ -83,7 +83,26 @@ SONIC_VLA_ROOT_ROT6D_LAYOUT="${SONIC_VLA_ROOT_ROT6D_LAYOUT:-row}"
 SONIC_VLA_ROOT_MAX_DELTA_DEG="${SONIC_VLA_ROOT_MAX_DELTA_DEG:-26.0}"
 SONIC_VLA_ACTION_FORMAT="raw107"
 SONIC_RAW107_BODY_SOURCE="${SONIC_RAW107_BODY_SOURCE:-native_decoder}"
+SONIC_RAW107_HAND_MODE="${SONIC_RAW107_HAND_MODE:-policy}"
+ACT_NEW107_EXECUTE_STEPS="${ACT_NEW107_EXECUTE_STEPS:-25}"
+SONIC_RAW107_SMOOTH_ALPHA="${SONIC_RAW107_SMOOTH_ALPHA:-1.0}"
 SONIC_RAW_STATE_JOINT_ORDER="${SONIC_RAW_STATE_JOINT_ORDER:-sonic}"
+if [[ "${SONIC_RAW107_HAND_MODE}" != "policy" && "${SONIC_RAW107_HAND_MODE}" != "open" ]]; then
+  echo "Error: SONIC_RAW107_HAND_MODE must be 'policy' or 'open', got: ${SONIC_RAW107_HAND_MODE}" >&2
+  exit 2
+fi
+if [[ ! "${ACT_NEW107_EXECUTE_STEPS}" =~ ^[0-9]+$ ]] || (( ACT_NEW107_EXECUTE_STEPS < 1 || ACT_NEW107_EXECUTE_STEPS > 25 )); then
+  echo "Error: ACT_NEW107_EXECUTE_STEPS must be an integer in [1, 25], got: ${ACT_NEW107_EXECUTE_STEPS}" >&2
+  exit 2
+fi
+if ! "${EVAL_PYTHON}" -c 'import math,sys; value=float(sys.argv[1]); assert math.isfinite(value) and 0.0 < value <= 1.0' "${SONIC_RAW107_SMOOTH_ALPHA}"; then
+  echo "Error: SONIC_RAW107_SMOOTH_ALPHA must be in (0, 1], got: ${SONIC_RAW107_SMOOTH_ALPHA}" >&2
+  exit 2
+fi
+if [[ "${SONIC_RAW107_BODY_SOURCE}" != "direct_raw" ]] && ! "${EVAL_PYTHON}" -c 'import math,sys; assert math.isclose(float(sys.argv[1]), 1.0)' "${SONIC_RAW107_SMOOTH_ALPHA}"; then
+  echo "Error: SONIC_RAW107_SMOOTH_ALPHA < 1 requires SONIC_RAW107_BODY_SOURCE=direct_raw" >&2
+  exit 2
+fi
 
 SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onnx}"
 SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
@@ -233,6 +252,8 @@ echo "Server Python: ${SERVER_PYTHON}"
 echo "Server port: mode=${SERVER_PORT_MODE} range=${SERVER_PORT_BASE}-${SERVER_PORT_MAX}"
 echo "Results dir: ${RESULTS_DIR}"
 echo "Raw observation joint order: ${SONIC_RAW_STATE_JOINT_ORDER}"
+echo "Raw107 hand mode: ${SONIC_RAW107_HAND_MODE}"
+echo "ACT raw107 rollout: predict=25 execute=${ACT_NEW107_EXECUTE_STEPS} direct_raw_smooth_alpha=${SONIC_RAW107_SMOOTH_ALPHA}"
 if [[ -d "${RESULTS_DIR}/episodes" ]]; then
   echo "Resume mode: reuse existing results in ${RESULTS_DIR}"
 fi
@@ -257,6 +278,9 @@ ARGS=(
   --sonic_vla_root_max_delta_deg "${SONIC_VLA_ROOT_MAX_DELTA_DEG}"
   --sonic_vla_action_format "${SONIC_VLA_ACTION_FORMAT}"
   --sonic_raw107_body_source "${SONIC_RAW107_BODY_SOURCE}"
+  --sonic_raw107_hand_mode "${SONIC_RAW107_HAND_MODE}"
+  --act_new107_execute_steps "${ACT_NEW107_EXECUTE_STEPS}"
+  --sonic_raw107_smooth_alpha "${SONIC_RAW107_SMOOTH_ALPHA}"
   --sonic_raw_state_joint_order "${SONIC_RAW_STATE_JOINT_ORDER}"
   --results_dir "${RESULTS_DIR}"
   --isaac_device "${ISAAC_DEVICE}"

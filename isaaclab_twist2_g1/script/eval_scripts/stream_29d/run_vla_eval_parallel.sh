@@ -66,6 +66,8 @@ VIDEO_H264="${VIDEO_H264:-1}"
 export HUMANOIDARENA_EVAL_VIDEO_H264="${VIDEO_H264}"
 POST_TERMINATION_RECORD_STEPS="${POST_TERMINATION_RECORD_STEPS:-10}"
 RECORD_VIDEO_EVERY_N="${RECORD_VIDEO_EVERY_N:-1}"
+THIRD_PERSON_CAMERA_IMAGE_WIDTH="${THIRD_PERSON_CAMERA_IMAGE_WIDTH:-1280}"
+THIRD_PERSON_CAMERA_IMAGE_HEIGHT="${THIRD_PERSON_CAMERA_IMAGE_HEIGHT:-720}"
 STEP_LOG_EVERY_N="${STEP_LOG_EVERY_N:-100}"
 SIM_VERBOSE_STARTUP="${SIM_VERBOSE_STARTUP:-0}"
 PRE_POLICY_SETTLE_STEPS="${PRE_POLICY_SETTLE_STEPS:-0}"
@@ -102,6 +104,14 @@ SONIC_RAW_STATE_JOINT_ORDER="${SONIC_RAW_STATE_JOINT_ORDER:-mujoco}"
 
 SONIC_ENCODER_PATH="${SONIC_ENCODER_PATH:-${SONIC_POLICY_ROOT}/model_encoder.onnx}"
 SONIC_DECODER_PATH="${SONIC_DECODER_PATH:-${SONIC_POLICY_ROOT}/model_decoder.onnx}"
+if [[ ! -f "${SONIC_ENCODER_PATH}" ]]; then
+  echo "Error: SONIC encoder not found: ${SONIC_ENCODER_PATH}" >&2
+  exit 2
+fi
+if [[ ! -f "${SONIC_DECODER_PATH}" ]]; then
+  echo "Error: SONIC decoder not found: ${SONIC_DECODER_PATH}" >&2
+  exit 2
+fi
 
 DEFAULT_SERVER_PYTHON="python"
 if [[ -x "/root/miniconda3/envs/lerobot_new/bin/python" ]]; then
@@ -111,27 +121,39 @@ elif [[ -x "/root/miniconda3/envs/lerobot/bin/python" ]]; then
 fi
 SERVER_PYTHON="${SERVER_PYTHON:-${DEFAULT_SERVER_PYTHON}}"
 SERVER_SCRIPT="${SERVER_SCRIPT:-${ISAACLAB_ROOT}/../lerobot/scripts/serve_lerobot_vla_http.py}"
-SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-/DATA/disk1/fym/vla/src}"
-SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-/share/beingm/yuxuan/model/paligemma_model=/DATA/disk1/fym/paligemma_model}"
+SERVER_LEROBOT_SRC="${SERVER_LEROBOT_SRC:-/DATA/disk0/fym/vla/src}"
+SERVER_TOKENIZER_PATH="${SERVER_TOKENIZER_PATH:-/DATA/disk0/fym/paligemma_model}"
+SERVER_CHECKPOINT_REF_REMAP="${SERVER_CHECKPOINT_REF_REMAP:-}"
+SERVER_CHECKPOINT_REF_REMAPS="${SERVER_CHECKPOINT_REF_REMAPS:-/share/beingm/pretrained/mllm/paligemma_model=${SERVER_TOKENIZER_PATH};/share/beingm/yuxuan/model/paligemma_model=${SERVER_TOKENIZER_PATH}}"
+if [[ ! -d "${SERVER_TOKENIZER_PATH}" ]]; then
+  echo "Error: Stream tokenizer directory not found: ${SERVER_TOKENIZER_PATH}" >&2
+  exit 2
+fi
 SERVER_VERBATIM_TASK="${SERVER_VERBATIM_TASK:-0}"
 SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE="${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE:-1}"
 SERVER_DISABLE_ACTION_DELTA_REFINER="${SERVER_DISABLE_ACTION_DELTA_REFINER:-0}"
-SERVER_N_ACTION_STEPS="${SERVER_N_ACTION_STEPS:-5}"
-SERVER_NUM_INFERENCE_STEPS="${SERVER_NUM_INFERENCE_STEPS:-0}"
-if [[ ! "${SERVER_N_ACTION_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "Error: SERVER_N_ACTION_STEPS must be a positive integer, got: ${SERVER_N_ACTION_STEPS}" >&2
-  exit 2
-fi
-if [[ ! "${SERVER_NUM_INFERENCE_STEPS}" =~ ^[0-9]+$ ]]; then
-  echo "Error: SERVER_NUM_INFERENCE_STEPS must be a non-negative integer, got: ${SERVER_NUM_INFERENCE_STEPS}" >&2
-  exit 2
-fi
+SERVER_STREAM_EXECUTION_HORIZON="${SERVER_STREAM_EXECUTION_HORIZON:-5}"
+SERVER_ACTION_DELTA_REFINER_WEIGHT="${SERVER_ACTION_DELTA_REFINER_WEIGHT:-1.0}"
+SERVER_NUM_INFERENCE_STEPS="${SERVER_NUM_INFERENCE_STEPS:-10}"
+SERVER_ZERO_INFERENCE_NOISE="${SERVER_ZERO_INFERENCE_NOISE:-0}"
 if [[ "${SERVER_VERBATIM_TASK}" != "0" && "${SERVER_VERBATIM_TASK}" != "1" ]]; then
   echo "Error: SERVER_VERBATIM_TASK must be 0 (mapped text) or 1 (verbatim), got: ${SERVER_VERBATIM_TASK}" >&2
   exit 2
 fi
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" != "0" && "${SERVER_DISABLE_ACTION_DELTA_REFINER}" != "1" ]]; then
   echo "Error: SERVER_DISABLE_ACTION_DELTA_REFINER must be 0 or 1, got: ${SERVER_DISABLE_ACTION_DELTA_REFINER}" >&2
+  exit 2
+fi
+if [[ "${SERVER_ZERO_INFERENCE_NOISE}" != "0" && "${SERVER_ZERO_INFERENCE_NOISE}" != "1" ]]; then
+  echo "Error: SERVER_ZERO_INFERENCE_NOISE must be 0 or 1, got: ${SERVER_ZERO_INFERENCE_NOISE}" >&2
+  exit 2
+fi
+if [[ ! "${SERVER_STREAM_EXECUTION_HORIZON}" =~ ^[0-9]+$ ]] || (( SERVER_STREAM_EXECUTION_HORIZON < 1 )); then
+  echo "Error: SERVER_STREAM_EXECUTION_HORIZON must be a positive integer, got: ${SERVER_STREAM_EXECUTION_HORIZON}" >&2
+  exit 2
+fi
+if [[ ! "${SERVER_NUM_INFERENCE_STEPS}" =~ ^[0-9]+$ ]] || (( SERVER_NUM_INFERENCE_STEPS < 1 )); then
+  echo "Error: SERVER_NUM_INFERENCE_STEPS must be a positive integer, got: ${SERVER_NUM_INFERENCE_STEPS}" >&2
   exit 2
 fi
 SERVER_GPU_IDS="${GPU_ID}"
@@ -258,6 +280,9 @@ DEFAULT_RESULTS_TAG="${TASK_RESULT_NAME}_stream_29d"
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]]; then
   DEFAULT_RESULTS_TAG="${DEFAULT_RESULTS_TAG}_no_refiner"
 fi
+if [[ "${SERVER_ZERO_INFERENCE_NOISE}" == "1" ]]; then
+  DEFAULT_RESULTS_TAG="${DEFAULT_RESULTS_TAG}_zero_noise"
+fi
 RESULTS_TAG_BASE="${RESULTS_TAG:-${DEFAULT_RESULTS_TAG}}"
 if [[ -n "${RESULTS_TAG_PREFIX:-}" ]]; then
   RESULTS_TAG="${RESULTS_TAG_PREFIX}_${RESULTS_TAG_BASE}"
@@ -275,15 +300,19 @@ echo "Task: ${TASK_NAME}"
 echo "Result task label: ${TASK_RESULT_NAME}"
 echo "Server task mode: $([[ "${SERVER_VERBATIM_TASK}" == "1" ]] && printf verbatim || printf mapped)"
 echo "Action delta refiner: $([[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]] && printf disabled || printf enabled)"
-echo "Server Stream execution horizon: ${SERVER_N_ACTION_STEPS} action step(s) per chunk"
-echo "Flow Matching inference steps: ${SERVER_NUM_INFERENCE_STEPS} (0 means checkpoint default)"
+echo "Stream execution horizon: ${SERVER_STREAM_EXECUTION_HORIZON} steps"
+echo "Flow-matching denoising steps: ${SERVER_NUM_INFERENCE_STEPS}"
+echo "Action delta refiner weight: ${SERVER_ACTION_DELTA_REFINER_WEIGHT}"
+echo "Inference noise: $([[ "${SERVER_ZERO_INFERENCE_NOISE}" == "1" ]] && printf zeros || printf sampled)"
 echo "GPU: physical ${GPU_ID}; server=${SERVER_DEVICE} with CUDA_VISIBLE_DEVICES=${GPU_ID}"
 echo "Isaac device: ${ISAAC_DEVICE}"
 echo "Server Python: ${SERVER_PYTHON}"
 echo "Server port: mode=${SERVER_PORT_MODE} range=${SERVER_PORT_BASE}-${SERVER_PORT_MAX}"
+echo "SONIC encoder: ${SONIC_ENCODER_PATH}"
+echo "SONIC decoder: ${SONIC_DECODER_PATH}"
+echo "Stream tokenizer: ${SERVER_TOKENIZER_PATH}"
 echo "Results dir: ${RESULTS_DIR}"
 echo "Raw observation joint order: ${SONIC_RAW_STATE_JOINT_ORDER}"
-echo "Pre-policy settling: ${PRE_POLICY_SETTLE_STEPS} physics step(s), robot pinned"
 if [[ -d "${RESULTS_DIR}/episodes" ]]; then
   echo "Resume mode: reuse existing results in ${RESULTS_DIR}"
 fi
@@ -296,6 +325,8 @@ ARGS=(
   --video_fps "${VIDEO_FPS}"
   --post_termination_record_steps "${POST_TERMINATION_RECORD_STEPS}"
   --record_video_every_n "${RECORD_VIDEO_EVERY_N}"
+  --third_person_camera_image_width "${THIRD_PERSON_CAMERA_IMAGE_WIDTH}"
+  --third_person_camera_image_height "${THIRD_PERSON_CAMERA_IMAGE_HEIGHT}"
   --step_log_every_n "${STEP_LOG_EVERY_N}"
   --num_workers "${NUM_WORKERS}"
   --server_port_base "${SERVER_PORT_BASE}"
@@ -315,16 +346,25 @@ ARGS=(
   --server_script "${SERVER_SCRIPT}"
   --server_lerobot_src "${SERVER_LEROBOT_SRC}"
   --server_device "${SERVER_DEVICE}"
-  --server_n_action_steps "${SERVER_N_ACTION_STEPS}"
-  --server_num_inference_steps "${SERVER_NUM_INFERENCE_STEPS}"
   --server_gpu_ids "${SERVER_GPU_IDS}"
   --server_host "${SERVER_HOST}"
   --server_scheme "${SERVER_SCHEME}"
+  --server_stream_execution_horizon "${SERVER_STREAM_EXECUTION_HORIZON}"
+  --server_num_inference_steps "${SERVER_NUM_INFERENCE_STEPS}"
+  --server_action_delta_refiner_weight "${SERVER_ACTION_DELTA_REFINER_WEIGHT}"
   --server_ready_timeout "${SERVER_READY_TIMEOUT}"
   --lerobot_server_timeout "${LEROBOT_SERVER_TIMEOUT}"
   --persistent_sim "${PERSISTENT_SIM}"
 )
 
+ORIGINAL_IFS="${IFS}"
+IFS=';' read -r -a SERVER_CHECKPOINT_REF_REMAP_ITEMS <<< "${SERVER_CHECKPOINT_REF_REMAPS}"
+IFS="${ORIGINAL_IFS}"
+for checkpoint_ref_remap in "${SERVER_CHECKPOINT_REF_REMAP_ITEMS[@]}"; do
+  if [[ -n "${checkpoint_ref_remap}" ]]; then
+    ARGS+=(--server_checkpoint_ref_remap "${checkpoint_ref_remap}")
+  fi
+done
 if [[ -n "${SERVER_CHECKPOINT_REF_REMAP}" ]]; then
   ARGS+=(--server_checkpoint_ref_remap "${SERVER_CHECKPOINT_REF_REMAP}")
 fi
@@ -336,6 +376,9 @@ if [[ "${SERVER_STRETCH_IMAGE_TO_POLICY_SHAPE}" == "1" ]]; then
 fi
 if [[ "${SERVER_DISABLE_ACTION_DELTA_REFINER}" == "1" ]]; then
   ARGS+=(--server_disable_action_delta_refiner)
+fi
+if [[ "${SERVER_ZERO_INFERENCE_NOISE}" == "1" ]]; then
+  ARGS+=(--server_zero_inference_noise)
 fi
 if [[ "${GPU_LOCK}" != "1" ]]; then
   ARGS+=(--disable_gpu_lock)

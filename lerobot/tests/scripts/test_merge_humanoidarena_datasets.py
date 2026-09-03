@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -9,6 +11,9 @@ from scripts.merge_humanoidarena_datasets import (
     build_derived_feature_specs,
     concatenate_stats,
     concatenate_vector_columns,
+    exact_feature_stats,
+    repair_merged_stats,
+    recompute_tabular_stats,
 )
 
 
@@ -68,3 +73,68 @@ def test_vector_columns_and_stats_use_the_same_concatenation_order() -> None:
     np.testing.assert_array_equal(action[0], expected)
     np.testing.assert_array_equal(action_stats["mean"], expected)
     np.testing.assert_array_equal(action_stats["count"], np.array([1]))
+
+
+def test_exact_feature_stats_uses_pooled_samples_for_multitask_quantiles() -> None:
+    # Per-task q01/q99 are both constant here. Averaging those summaries would
+    # fabricate [5, 5], even though the pooled data's true interval is [0, 10].
+    task_a = np.zeros((100, 1), dtype=np.float32)
+    task_b = np.full((100, 1), 10.0, dtype=np.float32)
+
+    stats = exact_feature_stats(np.concatenate([task_a, task_b]))
+
+    np.testing.assert_array_equal(stats["q01"], np.array([0.0]))
+    np.testing.assert_array_equal(stats["q50"], np.array([5.0]))
+    np.testing.assert_array_equal(stats["q99"], np.array([10.0]))
+
+
+def test_recompute_tabular_stats_scans_merged_parquet(tmp_path) -> None:
+    data_dir = tmp_path / "data" / "chunk-000"
+    data_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "action": [np.array([0.0], dtype=np.float32)] * 100,
+            "task": ["task_a"] * 100,
+        }
+    ).to_parquet(data_dir / "file-000.parquet", index=False)
+    pd.DataFrame(
+        {
+            "action": [np.array([10.0], dtype=np.float32)] * 100,
+            "task": ["task_b"] * 100,
+        }
+    ).to_parquet(data_dir / "file-001.parquet", index=False)
+
+    stats = recompute_tabular_stats(
+        tmp_path,
+        features={
+            "action": {"dtype": "float32", "shape": [1]},
+            "task": {"dtype": "string", "shape": [1]},
+        },
+        total_frames=200,
+    )
+
+    assert set(stats) == {"action"}
+    np.testing.assert_array_equal(stats["action"]["q01"], np.array([0.0]))
+    np.testing.assert_array_equal(stats["action"]["q99"], np.array([10.0]))
+
+
+def test_repair_merged_stats_keeps_backup_and_replaces_quantiles(tmp_path) -> None:
+    data_dir = tmp_path / "data" / "chunk-000"
+    meta_dir = tmp_path / "meta"
+    data_dir.mkdir(parents=True)
+    meta_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {"action": [np.array([0.0], dtype=np.float32), np.array([10.0], dtype=np.float32)]}
+    ).to_parquet(data_dir / "file-000.parquet", index=False)
+    (meta_dir / "info.json").write_text(
+        '{"total_frames": 2, "features": {"action": {"dtype": "float32", "shape": [1]}}}'
+    )
+    original_stats = '{"action": {"min": [0.0], "max": [10.0], "mean": [5.0], "std": [5.0], "count": [2], "q01": [5.0], "q10": [5.0], "q50": [5.0], "q90": [5.0], "q99": [5.0]}}'
+    (meta_dir / "stats.json").write_text(original_stats)
+
+    repair_merged_stats(tmp_path)
+
+    assert (meta_dir / "stats.before_exact_recompute.json").read_text() == original_stats
+    repaired = json.loads((meta_dir / "stats.json").read_text())
+    assert repaired["action"]["q01"] == [0.1]
+    assert repaired["action"]["q99"] == [9.9]

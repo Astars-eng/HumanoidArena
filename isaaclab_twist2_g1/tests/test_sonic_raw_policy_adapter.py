@@ -13,6 +13,7 @@ from action_provider.sonic_raw_policy_adapter import (
     build_sonic_raw_policy_observation,
     hand_alpha_to_joint_targets,
     reorder_sonic_joint_vector_to_mujoco,
+    select_sonic_raw107_hand_targets,
     sonic_raw_body_to_joint_targets,
     split_sonic_raw95_policy_action,
     split_sonic_raw_policy_action,
@@ -38,6 +39,47 @@ def test_split_sonic_raw_policy_action_preserves_all_dimensions():
     np.testing.assert_array_equal(split.encoder_token, action[29:93])
     np.testing.assert_array_equal(split.left_hand, action[93:100])
     np.testing.assert_array_equal(split.right_hand, action[100:107])
+
+
+def test_select_raw107_policy_hand_targets_preserves_predictions():
+    split = split_sonic_raw_policy_action(np.arange(107, dtype=np.float32))
+    left, right = select_sonic_raw107_hand_targets(
+        split,
+        mode="policy",
+        left_open_pose=np.zeros(7, dtype=np.float32),
+        right_open_pose=np.zeros(7, dtype=np.float32),
+    )
+
+    np.testing.assert_array_equal(left, split.left_hand)
+    np.testing.assert_array_equal(right, split.right_hand)
+
+
+def test_select_raw107_open_hand_targets_discards_predictions():
+    split = split_sonic_raw_policy_action(np.arange(107, dtype=np.float32))
+    left_open = np.linspace(0.0, 0.6, 7, dtype=np.float32)
+    right_open = -left_open
+    left, right = select_sonic_raw107_hand_targets(
+        split,
+        mode="open",
+        left_open_pose=left_open,
+        right_open_pose=right_open,
+    )
+
+    np.testing.assert_array_equal(left, left_open)
+    np.testing.assert_array_equal(right, right_open)
+    np.testing.assert_array_equal(split.body_raw, np.arange(29, dtype=np.float32))
+    np.testing.assert_array_equal(split.encoder_token, np.arange(29, 93, dtype=np.float32))
+
+
+def test_select_raw107_hand_targets_rejects_unknown_mode():
+    split = split_sonic_raw_policy_action(np.zeros(107, dtype=np.float32))
+    with pytest.raises(ValueError, match="Unsupported raw107 hand mode"):
+        select_sonic_raw107_hand_targets(
+            split,
+            mode="closed",
+            left_open_pose=np.zeros(7, dtype=np.float32),
+            right_open_pose=np.zeros(7, dtype=np.float32),
+        )
 
 
 def test_split_sonic_raw95_policy_action_preserves_all_dimensions():

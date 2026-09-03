@@ -149,6 +149,8 @@ def _start_server(args, model_path: str, log_path: Path):
         args.server_host,
         "--port",
         str(args.server_port),
+        "--act-execution-steps",
+        str(args.act_new107_execute_steps),
     ]
     if args.server_lerobot_src:
         cmd.extend(["--lerobot-src", args.server_lerobot_src])
@@ -273,6 +275,12 @@ def _run_episode(
         args.sonic_vla_action_format,
         "--sonic_raw107_body_source",
         args.sonic_raw107_body_source,
+        "--sonic_raw107_hand_mode",
+        args.sonic_raw107_hand_mode,
+        "--act_new107_execute_steps",
+        str(args.act_new107_execute_steps),
+        "--sonic_raw107_smooth_alpha",
+        str(args.sonic_raw107_smooth_alpha),
         "--sonic_raw_state_joint_order",
         args.sonic_raw_state_joint_order,
         "--model_path",
@@ -420,6 +428,12 @@ def _run_episode_batch(
         args.sonic_vla_action_format,
         "--sonic_raw107_body_source",
         args.sonic_raw107_body_source,
+        "--sonic_raw107_hand_mode",
+        args.sonic_raw107_hand_mode,
+        "--act_new107_execute_steps",
+        str(args.act_new107_execute_steps),
+        "--sonic_raw107_smooth_alpha",
+        str(args.sonic_raw107_smooth_alpha),
         "--sonic_raw_state_joint_order",
         args.sonic_raw_state_joint_order,
         "--model_path",
@@ -671,6 +685,9 @@ def _write_summary(run_dir: Path, results: list[dict]) -> None:
         "log_path",
         "vla_trace_path",
         "server_url",
+        "sonic_raw107_hand_mode",
+        "act_new107_execute_steps",
+        "sonic_raw107_smooth_alpha",
         "returncode",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as fp:
@@ -726,6 +743,26 @@ def main() -> int:
         default=os.environ.get("SONIC_RAW107_BODY_SOURCE", "native_decoder"),
         choices=["native_decoder", "direct_raw"],
         help="raw107 body interface; direct_raw is retained for mapping audits.",
+    )
+    parser.add_argument(
+        "--sonic_raw107_hand_mode",
+        type=str,
+        default=os.environ.get("SONIC_RAW107_HAND_MODE", "policy"),
+        choices=["policy", "open"],
+        help="Execute checkpoint-predicted hands or override both hands with the standard open pose.",
+    )
+    parser.add_argument(
+        "--act_new107_execute_steps",
+        type=int,
+        default=int(os.environ.get("ACT_NEW107_EXECUTE_STEPS", "25")),
+        choices=range(1, 26),
+        help="Execute this many actions from each predicted 25-step chunk before replanning.",
+    )
+    parser.add_argument(
+        "--sonic_raw107_smooth_alpha",
+        type=float,
+        default=float(os.environ.get("SONIC_RAW107_SMOOTH_ALPHA", "1.0")),
+        help="EMA alpha for direct_raw 29-D joint targets; 1.0 disables smoothing.",
     )
     parser.add_argument(
         "--sonic_raw_state_joint_order",

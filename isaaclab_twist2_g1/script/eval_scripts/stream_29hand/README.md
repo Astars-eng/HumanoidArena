@@ -72,6 +72,7 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29hand/run_vla_eval_parallel.
 - `GPU_ID`、`ISAAC_GPU_ID`、`ALLOW_SHARED_GPU`、`GPU_LOCK`。
 - `SERVER_PORT=auto`、`SERVER_PORT_BASE/MAX`、`MAX_STEPS`、`PERSISTENT_SIM`、`DRY_RUN=1`。
 - `SERVER_DISABLE_ACTION_DELTA_REFINER=1`：仅用于明确记录的消融。
+- `SERVER_ZERO_INFERENCE_NOISE=1`：将 Stream 推理的初始 action noise 设为全零；默认仍为标准高斯采样。
 - `SONIC_OUTPUT_DELAY_STEPS` 默认必须保持 `0`；若未来增加延迟，body 和 hand 必须进入同一延迟束。
 
 源码和 checkpoint 引用路径覆盖：
@@ -93,4 +94,3 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29hand/run_vla_eval_parallel.
 - 该接口比 `stream_29d` 多 14D 手部能力。操作任务的结果不能在未声明动作空间差异的情况下
   与 body-only 模型直接汇总。
 - 固定 checkpoint、任务 YAML、`MAX_STEPS`、seed/repeat、随机化、成功判定和视频采样规则。
-

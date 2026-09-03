@@ -466,6 +466,7 @@ def main() -> int:
     parser.add_argument('--server_verbatim_task', action='store_true', default=False)
     parser.add_argument('--server_stretch_image_to_policy_shape', action='store_true', default=False)
     parser.add_argument('--server_disable_action_delta_refiner', action='store_true', default=False)
+    parser.add_argument('--server_zero_inference_noise', action='store_true', default=False)
     parser.add_argument('--server_host', type=str, default='127.0.0.1')
     parser.add_argument('--server_scheme', type=str, default='http', choices=['http', 'https'])
     parser.add_argument('--tls_cert_file', type=str, default='')
@@ -679,6 +680,7 @@ def main() -> int:
         'server_task_mode': 'verbatim' if args.server_verbatim_task else 'mapped',
         'server_verbatim_task': bool(args.server_verbatim_task),
         'server_disable_action_delta_refiner': bool(args.server_disable_action_delta_refiner),
+        'server_zero_inference_noise': bool(args.server_zero_inference_noise),
         'total_jobs': len(all_jobs),
         'completed_results': len(results),
         'pending_results': max(0, len(all_jobs) - len(results)),

@@ -19,6 +19,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from task_runtime_profiles import apply_task_runtime_profile
+from act_new107_runtime import (
+    EXPECTED_PREDICTED_CHUNK_STEPS,
+    configure_act_new107_smoothing,
+)
 
 from isaaclab.app import AppLauncher
 
@@ -96,6 +100,26 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=os.environ.get("SONIC_RAW107_BODY_SOURCE", "native_decoder"),
         choices=["native_decoder", "direct_raw"],
+    )
+    parser.add_argument(
+        "--sonic_raw107_hand_mode",
+        type=str,
+        default=os.environ.get("SONIC_RAW107_HAND_MODE", "policy"),
+        choices=["policy", "open"],
+        help="Execute checkpoint-predicted hands or override both hands with the standard open pose.",
+    )
+    parser.add_argument(
+        "--act_new107_execute_steps",
+        type=int,
+        default=int(os.environ.get("ACT_NEW107_EXECUTE_STEPS", "25")),
+        choices=range(1, EXPECTED_PREDICTED_CHUNK_STEPS + 1),
+        help="Execute this many actions from each predicted 25-step chunk before replanning.",
+    )
+    parser.add_argument(
+        "--sonic_raw107_smooth_alpha",
+        type=float,
+        default=float(os.environ.get("SONIC_RAW107_SMOOTH_ALPHA", "1.0")),
+        help="EMA alpha for direct_raw 29-D joint targets; 1.0 disables smoothing.",
     )
     parser.add_argument(
         "--sonic_raw_state_joint_order",
@@ -643,6 +667,9 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "server_url": server_url,
         "sonic_vla_action_format": str(args_cli.sonic_vla_action_format),
         "sonic_raw107_body_source": str(args_cli.sonic_raw107_body_source),
+        "sonic_raw107_hand_mode": str(args_cli.sonic_raw107_hand_mode),
+        "act_new107_execute_steps": int(args_cli.act_new107_execute_steps),
+        "sonic_raw107_smooth_alpha": float(args_cli.sonic_raw107_smooth_alpha),
         "sonic_raw_state_joint_order": str(args_cli.sonic_raw_state_joint_order),
         "started_at": started_at,
         "finished_at": time.time(),
@@ -869,6 +896,8 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
 def main() -> int:
     parser = _build_parser()
     args_cli = parser.parse_args()
+    if not 0.0 < float(args_cli.sonic_raw107_smooth_alpha) <= 1.0:
+        parser.error("--sonic_raw107_smooth_alpha must be in (0, 1]")
     _install_interrupt_handlers()
     _ensure_unique_multi_image_shm_name(args_cli)
     args_cli.enable_cameras = True
@@ -940,6 +969,11 @@ def main() -> int:
             _log_verbose(args_cli, "[sim_eval_vla] startup checkpoint=after_create_action_provider")
             if action_provider is None:
                 raise RuntimeError("failed to create action provider")
+            if float(args_cli.sonic_raw107_smooth_alpha) < 1.0:
+                configure_act_new107_smoothing(
+                    action_provider,
+                    smooth_alpha=float(args_cli.sonic_raw107_smooth_alpha),
+                )
             _disable_action_provider_internal_recording(action_provider)
             env.action_provider = action_provider
 

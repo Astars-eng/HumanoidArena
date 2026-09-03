@@ -31,7 +31,7 @@ _KNOWN_HF_CHECKPOINT_REFS = {
 
 TASK_LANGUAGE_INSTRUCTIONS = {
     "HOI_double_desk": "Put the hammer from the right table into the basket on the left table.",
-    "HOI_football": "Kick the soccer ball into the goal.",
+    "HOI_football": "Kick the football into the goal.",
     "HOI_pp_box": "Move the box from the table onto the shelf.",
     "HSI_vision_navi": "Avoid obstacles and move to the yellow marked area.",
     "HSI_open_door": "Open the door.",
@@ -480,11 +480,34 @@ def _disable_stream_action_delta_refiner(policy) -> None:
     )
 
 
+def _enable_stream_zero_inference_noise(policy) -> None:
+    config = policy.config
+    if getattr(config, "type", None) != "stream":
+        raise ValueError(
+            "--zero-inference-noise is only supported for Stream policies; "
+            f"got policy type {getattr(config, 'type', None)!r}"
+        )
+    model = getattr(policy, "model", None)
+    if not callable(getattr(model, "sample_noise", None)):
+        raise ValueError("Stream policy model does not expose sample_noise()")
+
+    def _sample_zero_noise(shape, device):
+        return torch.zeros(size=shape, dtype=torch.float32, device=device)
+
+    model.sample_noise = _sample_zero_noise
+    policy._zero_inference_noise_enabled = True
+    print(
+        "[lerobot_vla_server] Stream inference initial noise overridden with zeros",
+        flush=True,
+    )
+
+
 def _load_policy(
     policy_dir: Path,
     device_name: str,
     *,
     disable_action_delta_refiner: bool = False,
+    zero_inference_noise: bool = False,
 ):
     lerobot_src_override = os.environ.get("LEROBOT_VLA_SRC", "").strip()
     lerobot_src = (
@@ -526,6 +549,8 @@ def _load_policy(
     policy = policy_cls.from_pretrained(effective_policy_dir, config=config)
     if disable_action_delta_refiner:
         _disable_stream_action_delta_refiner(policy)
+    if zero_inference_noise:
+        _enable_stream_zero_inference_noise(policy)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
         effective_policy_dir,
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
@@ -557,6 +582,7 @@ class LeRobotServerState:
         verbatim_task: bool = False,
         stretch_image_to_policy_shape: bool = False,
         disable_action_delta_refiner: bool = False,
+        zero_inference_noise: bool = False,
     ):
         (
             self.config,
@@ -570,6 +596,7 @@ class LeRobotServerState:
             policy_dir,
             device_name,
             disable_action_delta_refiner=disable_action_delta_refiner,
+            zero_inference_noise=zero_inference_noise,
         )
         self.expected_state_shape = _feature_shape_dim(self.config.input_features.get("observation.state"))
         self.expected_action_shape = _feature_shape_dim(self.config.output_features.get("action"))
@@ -601,6 +628,7 @@ class LeRobotServerState:
             )
         self.stretch_image_to_policy_shape = bool(stretch_image_to_policy_shape)
         self.disable_action_delta_refiner = bool(disable_action_delta_refiner)
+        self.zero_inference_noise = bool(zero_inference_noise)
         self.http_image_transform = _load_server_image_transform(policy_dir)
         # [interface conversion] Raw HumanoidArena checkpoints were trained on
         # the literal dataset task string.  Keep an explicit mode that prevents
@@ -1203,6 +1231,11 @@ def main():
         action="store_true",
         help="Disable the Stream action delta refiner and run the base Action Expert only.",
     )
+    parser.add_argument(
+        "--zero-inference-noise",
+        action="store_true",
+        help="Use an all-zero initial action-noise tensor for Stream inference.",
+    )
     args = parser.parse_args()
 
     if args.lerobot_src:
@@ -1232,6 +1265,7 @@ def main():
             verbatim_task=args.verbatim_task,
             stretch_image_to_policy_shape=args.stretch_image_to_policy_shape,
             disable_action_delta_refiner=args.disable_action_delta_refiner,
+            zero_inference_noise=args.zero_inference_noise,
         )
         server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 

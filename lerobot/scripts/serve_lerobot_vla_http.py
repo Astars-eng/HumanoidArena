@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import random
 import signal
@@ -23,6 +24,8 @@ import torch
 
 
 _SERVER_STOP_REASON = "unknown"
+_DEFAULT_STREAM_EXECUTION_HORIZON = 5
+_DEFAULT_STREAM_NUM_INFERENCE_STEPS = 10
 _LEGACY_CHECKPOINT_ROOT = Path("/mnt/workspace/users/xujunzhe/yunhengwang/lerobot/lerobot/checkpoints")
 _COMPAT_CHECKPOINT_ROOT = Path("/ai/Yichi/taowen/ckpts/checkpoints")
 _KNOWN_HF_CHECKPOINT_REFS = {
@@ -31,7 +34,7 @@ _KNOWN_HF_CHECKPOINT_REFS = {
 
 TASK_LANGUAGE_INSTRUCTIONS = {
     "HOI_double_desk": "Put the hammer from the right table into the basket on the left table.",
-    "HOI_football": "Kick the soccer ball into the goal.",
+    "HOI_football": "Kick the football into the goal.",
     "HOI_pp_box": "Move the box from the table onto the shelf.",
     "HSI_vision_navi": "Avoid obstacles and move to the yellow marked area.",
     "HSI_open_door": "Open the door.",
@@ -211,6 +214,126 @@ def _remap_json_tree(obj):
     return _remap_legacy_checkpoint_ref(obj)
 
 
+def _drop_unavailable_stream_vlm_preload(payload, policy_dir: Path):
+    """Avoid reloading a stale training-time VLM before a full Stream checkpoint."""
+
+    if not isinstance(payload, dict) or payload.get("type") != "stream":
+        return payload, False
+    if not (policy_dir / "model.safetensors").is_file():
+        return payload, False
+
+    vlm_pretrained_path = payload.get("vlm_pretrained_path")
+    if not isinstance(vlm_pretrained_path, str) or not vlm_pretrained_path:
+        return payload, False
+    try:
+        vlm_path = Path(vlm_pretrained_path).expanduser()
+    except Exception:
+        return payload, False
+    if not vlm_path.is_absolute() or vlm_path.exists():
+        return payload, False
+
+    # Stream's exported model.safetensors is self-contained.  The saved
+    # vlm_pretrained_path only records how training initialized the backbone;
+    # loading it again during from_pretrained() is redundant and makes a
+    # portable checkpoint depend on the training machine's filesystem.
+    updated = dict(payload)
+    updated["vlm_pretrained_path"] = None
+    print(
+        "[lerobot_vla_server] skip unavailable training-time Stream VLM preload "
+        f"{vlm_pretrained_path}; using self-contained {policy_dir / 'model.safetensors'}",
+        flush=True,
+    )
+    return updated, True
+
+
+def _normalize_portable_stream_config(payload):
+    """Remove export-only Stream fields unsupported by the deployed fork."""
+
+    if not isinstance(payload, dict) or payload.get("type") != "stream":
+        return payload, False
+
+    updated = dict(payload)
+    changed = False
+    for field_name, empty_value in (
+        ("action_expert_state_keys", []),
+        ("state_key_dims", {}),
+    ):
+        if field_name not in updated:
+            continue
+        if updated[field_name] != empty_value:
+            raise ValueError(
+                f"Unsupported non-empty Stream checkpoint field {field_name}: "
+                f"{updated[field_name]!r}"
+            )
+        updated.pop(field_name)
+        changed = True
+        print(
+            f"[lerobot_vla_server] drop empty export-only Stream config field {field_name}",
+            flush=True,
+        )
+
+    if "inference_noise_mode" in updated:
+        inference_noise_mode = updated.pop("inference_noise_mode")
+        if inference_noise_mode not in {"zero", "sampled", "normal", "gaussian"}:
+            raise ValueError(
+                "Unsupported Stream checkpoint inference_noise_mode: "
+                f"{inference_noise_mode!r}"
+            )
+        changed = True
+        print(
+            "[lerobot_vla_server] Stream checkpoint inference_noise_mode="
+            f"{inference_noise_mode!r}; runtime noise is controlled by --zero-inference-noise",
+            flush=True,
+        )
+
+    return updated, changed
+
+
+def _normalize_portable_pi05_config(payload, policy_dir: Path):
+    """Drop training/export-only PI0.5 fields absent from the deployed config class."""
+
+    if not isinstance(payload, dict) or payload.get("type") != "pi05":
+        return payload, False
+
+    updated = dict(payload)
+    changed = False
+
+    if "tokenizer_name" in updated:
+        tokenizer_name = updated.pop("tokenizer_name")
+        if tokenizer_name is not None and not isinstance(tokenizer_name, str):
+            raise ValueError(
+                "Unsupported PI0.5 checkpoint tokenizer_name: "
+                f"expected string or null, got {tokenizer_name!r}"
+            )
+        changed = True
+        print(
+            "[lerobot_vla_server] drop export-only PI0.5 config field tokenizer_name; "
+            "the saved policy preprocessor owns tokenizer loading",
+            flush=True,
+        )
+
+    if "adapt_action_head_from_pretrained" in updated:
+        adapt_action_head = updated.pop("adapt_action_head_from_pretrained")
+        if not isinstance(adapt_action_head, bool):
+            raise ValueError(
+                "Unsupported PI0.5 checkpoint adapt_action_head_from_pretrained: "
+                f"expected bool, got {adapt_action_head!r}"
+            )
+        if not (policy_dir / "model.safetensors").is_file():
+            raise FileNotFoundError(
+                "Cannot drop PI0.5 training-time action-head adaptation setting without "
+                f"exported weights: {policy_dir / 'model.safetensors'}"
+            )
+        changed = True
+        print(
+            "[lerobot_vla_server] drop training-only PI0.5 config field "
+            f"adapt_action_head_from_pretrained={adapt_action_head}; loading exported weights",
+            flush=True,
+        )
+
+    return updated, changed
+
+
 def _prepare_compat_policy_dir(policy_dir: Path):
     temp_dir = tempfile.TemporaryDirectory(prefix="lerobot_policy_compat_")
     compat_dir = Path(temp_dir.name)
@@ -226,7 +349,21 @@ def _prepare_compat_policy_dir(policy_dir: Path):
         except Exception:
             continue
 
-        remapped_payload, changed = _remap_json_tree(payload)
+        if json_path.name == "config.json":
+            payload, dropped_vlm_preload = _drop_unavailable_stream_vlm_preload(payload, policy_dir)
+            payload, normalized_stream_config = _normalize_portable_stream_config(payload)
+            payload, normalized_pi05_config = _normalize_portable_pi05_config(payload, policy_dir)
+        else:
+            dropped_vlm_preload = False
+            normalized_stream_config = False
+            normalized_pi05_config = False
+        remapped_payload, remapped_refs = _remap_json_tree(payload)
+        changed = (
+            dropped_vlm_preload
+            or normalized_stream_config
+            or normalized_pi05_config
+            or remapped_refs
+        )
         if not changed:
             continue
 
@@ -480,13 +617,174 @@ def _disable_stream_action_delta_refiner(policy) -> None:
     )
 
 
+def _set_stream_action_delta_refiner_weight(policy, weight: float) -> None:
+    """Scale the Refiner's applied residual without changing checkpoint weights."""
+    config = policy.config
+    if getattr(config, "type", None) != "stream":
+        if math.isclose(weight, 1.0):
+            return
+        raise ValueError(
+            "--action-delta-refiner-weight is only supported for Stream policies; "
+            f"got policy type {getattr(config, 'type', None)!r}"
+        )
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("--action-delta-refiner-weight must be finite and non-negative")
+    if not bool(getattr(config, "action_delta_refiner_enabled", False)):
+        if not math.isclose(weight, 1.0):
+            raise ValueError(
+                "Cannot change --action-delta-refiner-weight because the checkpoint refiner is disabled"
+            )
+        policy._action_delta_refiner_runtime_weight = 1.0
+        return
+    if not callable(getattr(policy, "refine_action_step", None)):
+        raise ValueError("Stream policy does not expose refine_action_step() for runtime weighting")
+    if math.isclose(weight, 1.0):
+        policy._action_delta_refiner_runtime_weight = 1.0
+        print(
+            "[lerobot_vla_server] action delta refiner runtime weight=1 (checkpoint behavior)",
+            flush=True,
+        )
+        return
+
+    original_refine_action_step = policy.refine_action_step
+
+    def _weighted_refine_action_step(base_action, *args, **kwargs):
+        refined_action = original_refine_action_step(base_action, *args, **kwargs)
+        if refined_action.shape != base_action.shape:
+            raise ValueError(
+                "Runtime Refiner weighting requires matching base/refined action shapes; "
+                f"got base={tuple(base_action.shape)}, refined={tuple(refined_action.shape)}"
+            )
+        return base_action + weight * (refined_action - base_action)
+
+    policy.refine_action_step = _weighted_refine_action_step
+    policy._action_delta_refiner_runtime_weight = float(weight)
+    print(
+        f"[lerobot_vla_server] action delta refiner runtime weight={weight:g}",
+        flush=True,
+    )
+
+
+def _enable_stream_zero_inference_noise(policy) -> None:
+    config = policy.config
+    if getattr(config, "type", None) != "stream":
+        raise ValueError(
+            "--zero-inference-noise is only supported for Stream policies; "
+            f"got policy type {getattr(config, 'type', None)!r}"
+        )
+    model = getattr(policy, "model", None)
+    if not callable(getattr(model, "sample_noise", None)):
+        raise ValueError("Stream policy model does not expose sample_noise()")
+
+    def _sample_zero_noise(shape, device):
+        return torch.zeros(size=shape, dtype=torch.float32, device=device)
+
+    model.sample_noise = _sample_zero_noise
+    policy._zero_inference_noise_enabled = True
+    print(
+        "[lerobot_vla_server] Stream inference initial noise overridden with zeros",
+        flush=True,
+    )
+
+
+def _set_stream_execution_horizon(config, execution_horizon: int) -> None:
+    """Override how many queued Stream actions are consumed before replanning."""
+    if getattr(config, "type", None) != "stream":
+        if execution_horizon != _DEFAULT_STREAM_EXECUTION_HORIZON:
+            raise ValueError(
+                "--stream-execution-horizon is only supported for Stream policies; "
+                f"got policy type {getattr(config, 'type', None)!r}"
+            )
+        return
+    chunk_size = int(getattr(config, "chunk_size", 0))
+    if execution_horizon <= 0:
+        raise ValueError("--stream-execution-horizon must be a positive integer")
+    if execution_horizon > chunk_size:
+        raise ValueError(
+            "--stream-execution-horizon cannot exceed the checkpoint chunk_size; "
+            f"got horizon={execution_horizon}, chunk_size={chunk_size}"
+        )
+    checkpoint_n_action_steps = int(getattr(config, "n_action_steps", chunk_size))
+    config.n_action_steps = int(execution_horizon)
+    print(
+        "[lerobot_vla_server] Stream execution horizon "
+        f"checkpoint={checkpoint_n_action_steps} runtime={config.n_action_steps} "
+        f"chunk_size={chunk_size}",
+        flush=True,
+    )
+
+
+def _set_act_execution_steps(config, execution_steps: int | None) -> None:
+    """Override how many queued ACT actions are consumed before replanning."""
+    if execution_steps is None:
+        return
+    if getattr(config, "type", None) != "act":
+        raise ValueError(
+            "--act-execution-steps is only supported for ACT policies; "
+            f"got policy type {getattr(config, 'type', None)!r}"
+        )
+    if isinstance(execution_steps, bool) or not isinstance(execution_steps, int):
+        raise ValueError("--act-execution-steps must be a positive integer")
+    chunk_size = int(getattr(config, "chunk_size", 0))
+    if execution_steps <= 0 or execution_steps > chunk_size:
+        raise ValueError(
+            "--act-execution-steps must be in the checkpoint chunk range; "
+            f"got steps={execution_steps}, chunk_size={chunk_size}"
+        )
+    checkpoint_n_action_steps = int(getattr(config, "n_action_steps", chunk_size))
+    config.n_action_steps = int(execution_steps)
+    print(
+        "[lerobot_vla_server] ACT execution steps "
+        f"checkpoint={checkpoint_n_action_steps} runtime={config.n_action_steps} "
+        f"chunk_size={chunk_size}",
+        flush=True,
+    )
+
+
+def _set_stream_num_inference_steps(config, num_inference_steps: int) -> None:
+    """Override the number of Stream flow-matching denoising steps at inference time."""
+    if getattr(config, "type", None) != "stream":
+        if num_inference_steps != _DEFAULT_STREAM_NUM_INFERENCE_STEPS:
+            raise ValueError(
+                "--num-inference-steps is only supported for Stream policies; "
+                f"got policy type {getattr(config, 'type', None)!r}"
+            )
+        return
+    if (
+        isinstance(num_inference_steps, bool)
+        or not isinstance(num_inference_steps, int)
+        or num_inference_steps <= 0
+    ):
+        raise ValueError("--num-inference-steps must be a positive integer")
+    if not hasattr(config, "num_inference_steps"):
+        raise ValueError("Stream policy config does not expose num_inference_steps")
+    if bool(getattr(config, "attention_trace_enabled", False)) and int(
+        getattr(config, "attention_trace_flow_step", 0)
+    ) >= num_inference_steps:
+        raise ValueError(
+            "--num-inference-steps must exceed attention_trace_flow_step when attention tracing "
+            f"is enabled; got steps={num_inference_steps}, "
+            f"flow_step={getattr(config, 'attention_trace_flow_step', None)}"
+        )
+    checkpoint_num_inference_steps = int(config.num_inference_steps)
+    config.num_inference_steps = int(num_inference_steps)
+    print(
+        "[lerobot_vla_server] Stream flow-matching denoising steps "
+        f"checkpoint={checkpoint_num_inference_steps} runtime={config.num_inference_steps}",
+        flush=True,
+    )
+
+
 def _load_policy(
     policy_dir: Path,
     device_name: str,
     *,
     disable_action_delta_refiner: bool = False,
-    n_action_steps: int = 5,
-    num_inference_steps: int = 0,
+    zero_inference_noise: bool = False,
+    stream_execution_horizon: int = _DEFAULT_STREAM_EXECUTION_HORIZON,
+    num_inference_steps: int = _DEFAULT_STREAM_NUM_INFERENCE_STEPS,
+    action_delta_refiner_weight: float = 1.0,
+    act_execution_steps: int | None = None,
 ):
     lerobot_src_override = os.environ.get("LEROBOT_VLA_SRC", "").strip()
     lerobot_src = (
@@ -520,28 +818,14 @@ def _load_policy(
     config = PreTrainedConfig.from_pretrained(effective_policy_dir)
     config.device = device_name
 
-    if getattr(config, "type", None) == "stream":
-        requested_steps = int(n_action_steps)
-        chunk_size = int(getattr(config, "chunk_size", 0) or 0)
-        if requested_steps <= 0:
-            raise ValueError(f"--n-action-steps must be >= 1, got {requested_steps}")
-        if chunk_size > 0 and requested_steps > chunk_size:
-            raise ValueError(
-                f"--n-action-steps ({requested_steps}) cannot exceed checkpoint chunk_size ({chunk_size})"
-            )
-        config.n_action_steps = requested_steps
-        requested_inference_steps = int(num_inference_steps)
-        if requested_inference_steps < 0:
-            raise ValueError(
-                f"--num-inference-steps must be >= 0, got {requested_inference_steps}"
-            )
-        if requested_inference_steps > 0:
-            config.num_inference_steps = requested_inference_steps
-        print(
-            f"[lerobot_vla_server] Stream execution horizon n_action_steps={requested_steps} "
-            f"checkpoint_chunk_size={chunk_size} "
-            f"num_inference_steps={int(config.num_inference_steps)}",
-            flush=True,
+    _set_act_execution_steps(config, act_execution_steps)
+    _set_stream_num_inference_steps(config, num_inference_steps)
+    _set_stream_execution_horizon(config, stream_execution_horizon)
+
+    if disable_action_delta_refiner and not math.isclose(action_delta_refiner_weight, 1.0):
+        raise ValueError(
+            "--disable-action-delta-refiner and a non-default "
+            "--action-delta-refiner-weight cannot be used together"
         )
 
     policy_cls = get_policy_class(config.type)
@@ -549,9 +833,14 @@ def _load_policy(
     policy = policy_cls.from_pretrained(effective_policy_dir, config=config)
     if disable_action_delta_refiner:
         _disable_stream_action_delta_refiner(policy)
+    else:
+        _set_stream_action_delta_refiner_weight(policy, action_delta_refiner_weight)
+    if zero_inference_noise:
+        _enable_stream_zero_inference_noise(policy)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
         effective_policy_dir,
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+        overrides={"device_processor": {"device": device_name}},
     )
     postprocessor = PolicyProcessorPipeline.from_pretrained(
         effective_policy_dir,
@@ -580,8 +869,11 @@ class LeRobotServerState:
         verbatim_task: bool = False,
         stretch_image_to_policy_shape: bool = False,
         disable_action_delta_refiner: bool = False,
-        n_action_steps: int = 5,
-        num_inference_steps: int = 0,
+        zero_inference_noise: bool = False,
+        stream_execution_horizon: int = _DEFAULT_STREAM_EXECUTION_HORIZON,
+        num_inference_steps: int = _DEFAULT_STREAM_NUM_INFERENCE_STEPS,
+        action_delta_refiner_weight: float = 1.0,
+        act_execution_steps: int | None = None,
     ):
         (
             self.config,
@@ -595,8 +887,11 @@ class LeRobotServerState:
             policy_dir,
             device_name,
             disable_action_delta_refiner=disable_action_delta_refiner,
-            n_action_steps=n_action_steps,
+            zero_inference_noise=zero_inference_noise,
+            stream_execution_horizon=stream_execution_horizon,
             num_inference_steps=num_inference_steps,
+            action_delta_refiner_weight=action_delta_refiner_weight,
+            act_execution_steps=act_execution_steps,
         )
         self.expected_state_shape = _feature_shape_dim(self.config.input_features.get("observation.state"))
         self.expected_action_shape = _feature_shape_dim(self.config.output_features.get("action"))
@@ -605,6 +900,17 @@ class LeRobotServerState:
         )
         self.stretch_image_to_policy_shape = bool(stretch_image_to_policy_shape)
         self.disable_action_delta_refiner = bool(disable_action_delta_refiner)
+        self.zero_inference_noise = bool(zero_inference_noise)
+        self.stream_execution_horizon = int(stream_execution_horizon)
+        self.num_inference_steps = int(num_inference_steps)
+        self.action_delta_refiner_weight = float(action_delta_refiner_weight)
+        self.act_execution_steps = act_execution_steps
+        self.effective_action_delta_refiner_weight = (
+            0.0
+            if self.disable_action_delta_refiner
+            or not bool(getattr(self.config, "action_delta_refiner_enabled", False))
+            else self.action_delta_refiner_weight
+        )
         self.http_image_transform = _load_server_image_transform(policy_dir)
         # [interface conversion] Raw HumanoidArena checkpoints were trained on
         # the literal dataset task string.  Keep an explicit mode that prevents
@@ -638,6 +944,7 @@ class LeRobotServerState:
             "[lerobot_vla_server] action delta refiner "
             f"checkpoint_enabled={bool(getattr(self.config, 'action_delta_refiner_enabled', False))} "
             f"runtime_enabled={bool(getattr(self.config, 'action_delta_refiner_enabled', False)) and not self.disable_action_delta_refiner} "
+            f"runtime_weight={self.effective_action_delta_refiner_weight:g} "
             f"base_hz={getattr(self.config, 'base_action_frequency_hz', None)} "
             f"refiner_hz={getattr(self.config, 'action_delta_refiner_frequency_hz', None)}",
             flush=True,
@@ -944,8 +1251,61 @@ class LeRobotServerState:
         with self.lock:
             with torch.inference_mode(), self._amp_context():
                 processed_observation = self._prepare_observation(observation, robot_type, task)
-                action = self.policy.select_action(processed_observation)
-                return self.postprocessor(action)
+                normalized_refined_action = self.policy.select_action(processed_observation)
+                refined_action = self.postprocessor(normalized_refined_action)
+
+                # Stream exposes the exact normalized base action dequeued for
+                # this control tick.  Persist both spaces: normalized values
+                # isolate the Refiner's applied residual, while postprocessed
+                # values are the commands seen by HumanoidArena.
+                get_base_action = getattr(self.policy, "get_last_action_before_refiner", None)
+                normalized_base_action = get_base_action() if callable(get_base_action) else None
+                get_action_metadata = getattr(self.policy, "get_last_action_metadata", None)
+                action_metadata = get_action_metadata() if callable(get_action_metadata) else {}
+                action_metadata = dict(action_metadata or {})
+                if getattr(self.config, "type", None) == "stream":
+                    action_metadata.update(
+                        {
+                            "execution_horizon": int(self.config.n_action_steps),
+                            "num_inference_steps": int(self.config.num_inference_steps),
+                            "action_delta_refiner_weight": self.effective_action_delta_refiner_weight,
+                        }
+                    )
+
+                trace = {
+                    "schema_version": 1,
+                    "action_metadata": action_metadata,
+                    "normalized_refined_action": (
+                        normalized_refined_action.detach().cpu().to(torch.float32).reshape(-1).tolist()
+                    ),
+                    "refined_action": refined_action.detach().cpu().to(torch.float32).reshape(-1).tolist(),
+                }
+                if normalized_base_action is not None:
+                    base_action = self.postprocessor(normalized_base_action)
+                    normalized_base = normalized_base_action.detach().cpu().to(torch.float32).reshape(-1)
+                    normalized_refined = (
+                        normalized_refined_action.detach().cpu().to(torch.float32).reshape(-1)
+                    )
+                    base = base_action.detach().cpu().to(torch.float32).reshape(-1)
+                    refined = refined_action.detach().cpu().to(torch.float32).reshape(-1)
+                    trace.update(
+                        {
+                            "normalized_base_action": normalized_base.tolist(),
+                            "normalized_refiner_applied_delta": (normalized_refined - normalized_base).tolist(),
+                            "base_action": base.tolist(),
+                            "refiner_applied_delta": (refined - base).tolist(),
+                        }
+                    )
+                else:
+                    trace.update(
+                        {
+                            "normalized_base_action": None,
+                            "normalized_refiner_applied_delta": None,
+                            "base_action": None,
+                            "refiner_applied_delta": None,
+                        }
+                    )
+                return refined_action, trace
 
     def infer_chunk(self, observation: dict, robot_type: str, task: str | None) -> np.ndarray:
         with self.lock:
@@ -1069,7 +1429,7 @@ def make_handler(state: LeRobotServerState):
                     }
                     log_suffix = f"chunk_size={action_chunk.shape[0]} first_action={first_action.tolist()}"
                 else:
-                    action = state.infer(observation, robot_type, task_instruction)
+                    action, action_trace = state.infer(observation, robot_type, task_instruction)
                     if not isinstance(action, torch.Tensor):
                         action = torch.as_tensor(action)
                     action = action.detach().cpu().to(torch.float32).reshape(-1)
@@ -1077,8 +1437,23 @@ def make_handler(state: LeRobotServerState):
                         raise ValueError(
                             f"Expected action shape {state.expected_action_shape}, got {tuple(action.shape)}"
                         )
-                    response = {"action": action.tolist()}
+                    response = {"action": action.tolist(), "action_trace": action_trace}
                     log_suffix = f"action={action.tolist()}"
+                    trace_metadata = action_trace.get("action_metadata") or {}
+                    normalized_delta = action_trace.get("normalized_refiner_applied_delta")
+                    delta_l2 = (
+                        float(np.linalg.norm(np.asarray(normalized_delta, dtype=np.float32)))
+                        if normalized_delta is not None
+                        else float("nan")
+                    )
+                    print(
+                        "[lerobot_vla_server][action_trace] "
+                        f"infer={infer_index} chunk_index={trace_metadata.get('chunk_index')} "
+                        f"chunk_step_index={trace_metadata.get('chunk_step_index')} "
+                        f"chunk_start={trace_metadata.get('chunk_start')} "
+                        f"normalized_refiner_delta_l2={delta_l2:.6f}",
+                        flush=True,
+                    )
 
                 state.infer_count = infer_index
                 print(f"[lerobot_vla_server] infer count={infer_index} {log_suffix}", flush=True)
@@ -1142,16 +1517,37 @@ def main():
         help="Disable the Stream action delta refiner and run the base Action Expert only.",
     )
     parser.add_argument(
-        "--n-action-steps",
+        "--stream-execution-horizon",
+        "--stream-execution-steps",
+        dest="stream_execution_horizon",
         type=int,
-        default=5,
-        help="Number of actions consumed from each Stream chunk before replanning (default: 5).",
+        default=_DEFAULT_STREAM_EXECUTION_HORIZON,
+        help="Number of predicted Stream actions to execute before predicting a new chunk.",
+    )
+    parser.add_argument(
+        "--act-execution-steps",
+        type=int,
+        default=None,
+        help="Number of predicted ACT actions to execute before predicting a new chunk.",
+    )
+    parser.add_argument(
+        "--action-delta-refiner-weight",
+        "--stream-refiner-gain",
+        dest="action_delta_refiner_weight",
+        type=float,
+        default=1.0,
+        help="Scale the Stream Refiner residual as base + weight * (refined - base).",
     )
     parser.add_argument(
         "--num-inference-steps",
         type=int,
-        default=0,
-        help="Flow Matching denoising steps; 0 keeps the checkpoint value.",
+        default=_DEFAULT_STREAM_NUM_INFERENCE_STEPS,
+        help="Number of flow-matching denoising steps used for Stream inference.",
+    )
+    parser.add_argument(
+        "--zero-inference-noise",
+        action="store_true",
+        help="Use an all-zero initial action-noise tensor for Stream inference.",
     )
     args = parser.parse_args()
 
@@ -1182,8 +1578,11 @@ def main():
             verbatim_task=args.verbatim_task,
             stretch_image_to_policy_shape=args.stretch_image_to_policy_shape,
             disable_action_delta_refiner=args.disable_action_delta_refiner,
-            n_action_steps=args.n_action_steps,
+            zero_inference_noise=args.zero_inference_noise,
+            stream_execution_horizon=args.stream_execution_horizon,
             num_inference_steps=args.num_inference_steps,
+            action_delta_refiner_weight=args.action_delta_refiner_weight,
+            act_execution_steps=args.act_execution_steps,
         )
         server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 

@@ -20,6 +20,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from task_runtime_profiles import apply_task_runtime_profile
+from third_person_camera import world_camera_video_dir
 
 from isaaclab.app import AppLauncher
 
@@ -85,8 +86,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lerobot_server_url", type=str, required=True)
     parser.add_argument("--lerobot_server_timeout", type=float, default=5.0)
     parser.add_argument("--lerobot_server_verify_ssl", action="store_true", default=False)
-    parser.add_argument("--server_n_action_steps", type=int, default=5)
-    parser.add_argument("--server_num_inference_steps", type=int, default=0)
     parser.add_argument("--lerobot_gripper_threshold", type=float, default=0.5)
     parser.add_argument(
         "--sonic_vla_action_format",
@@ -114,17 +113,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--post_termination_record_steps", type=int, default=0)
     parser.add_argument("--record_video_every_n", type=int, default=1)
+    parser.add_argument("--third_person_camera_image_width", type=int, default=1280)
+    parser.add_argument("--third_person_camera_image_height", type=int, default=720)
     parser.add_argument("--step_log_every_n", type=int, default=0)
     parser.add_argument("--verbose_startup", action="store_true", default=False)
-    parser.add_argument(
-        "--pre_policy_settle_steps",
-        type=int,
-        default=int(os.environ.get("PRE_POLICY_SETTLE_STEPS", "0") or 0),
-        help=(
-            "Physics-only settling steps after each episode reset. The robot root and joints are "
-            "pinned to their reset state, and VLA inference/recording starts only after settling."
-        ),
-    )
     parser.add_argument("--disable_fall_detection", action="store_true", default=False)
     parser.add_argument("--fall_tilt_deg", type=float, default=60.0)
     parser.add_argument("--fall_hard_tilt_deg", type=float, default=75.0)
@@ -157,6 +149,11 @@ def _should_log_reward_step(args, step_idx: int) -> bool:
     if every <= 0:
         return False
     return step_idx == 1 or step_idx % every == 0
+
+
+def _validate_third_person_camera_args(args) -> None:
+    if int(args.third_person_camera_image_width) <= 0 or int(args.third_person_camera_image_height) <= 0:
+        raise ValueError("third-person camera image dimensions must be positive")
 
 
 def _cuda_device_index(device: str) -> int | None:
@@ -215,6 +212,7 @@ def _normalize_control_routing(args):
     args.lerobot_policy_path = ""
     args.lerobot_policy_device = ""
     args.sonic_pose_source = "redis"
+    # The evaluator owns third-person video capture; keep provider-side raw recording disabled.
     args.enable_world_camera = False
 
     if not args.recording_save_dir:
@@ -281,24 +279,60 @@ def _notify_action_provider_env_reset(action_provider):
     _disable_action_provider_internal_recording(action_provider)
 
 
-def _capture_front_camera_rgb(env):
-    try:
-        if "front_camera" not in env.scene.keys():
-            return None
-        camera = env.scene["front_camera"]
-        rgb = camera.data.output.get("rgb")
-        if rgb is None:
-            return None
-        frame = rgb[0].detach().cpu().numpy()
-        if frame.ndim != 3:
-            return None
-        if frame.shape[-1] == 4:
-            frame = frame[..., :3]
-        if frame.dtype != "uint8":
-            frame = frame.clip(0, 255).astype("uint8")
-        return frame
-    except Exception:
-        return None
+def _ensure_third_person_camera_cfg(env_cfg, args_cli) -> None:
+    """Ensure every stream_29d task owns the same RGB third-person sensor."""
+    from tasks.common_config import CameraPresets
+
+    scene_cfg = getattr(env_cfg, "scene", None)
+    if scene_cfg is None:
+        raise RuntimeError("third-person recording requires env_cfg.scene")
+
+    image_width = int(args_cli.third_person_camera_image_width)
+    image_height = int(args_cli.third_person_camera_image_height)
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("third-person camera image dimensions must be positive")
+
+    camera_cfg = getattr(scene_cfg, "world_camera", None)
+    if camera_cfg is None:
+        camera_cfg = CameraPresets.g1_world_camera(height=image_height, width=image_width)
+        scene_cfg.world_camera = camera_cfg
+        source = "injected"
+    else:
+        camera_cfg.height = image_height
+        camera_cfg.width = image_width
+        source = "task"
+
+    # Evaluation only needs RGB video; avoiding an unused 720p depth buffer keeps
+    # the second camera affordable for persistent and multi-model runs.
+    camera_cfg.data_types = ["rgb"]
+    print(
+        "[sim_eval_vla] third-person camera configured "
+        f"source={source} prim_path={camera_cfg.prim_path} resolution={image_width}x{image_height}"
+    )
+
+
+def _capture_camera_rgb(env, camera_name: str):
+    if camera_name not in env.scene.keys():
+        raise RuntimeError(f"required video camera is missing from scene: {camera_name}")
+    camera = env.scene[camera_name]
+    rgb = camera.data.output.get("rgb")
+    if rgb is None:
+        raise RuntimeError(f"camera has no RGB output: {camera_name}")
+    frame = rgb[0].detach().cpu().numpy()
+    if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+        raise RuntimeError(f"invalid RGB frame shape from {camera_name}: {frame.shape}")
+    if frame.shape[-1] == 4:
+        frame = frame[..., :3]
+    if frame.dtype != "uint8":
+        frame = frame.clip(0, 255).astype("uint8")
+    return frame
+
+
+def _record_episode_video_frames(env, recorders: dict[str, object]) -> None:
+    if not recorders:
+        return
+    recorders["front"].add_frame(_capture_camera_rgb(env, "front_camera"))
+    recorders["third_person"].add_frame(_capture_camera_rgb(env, "world_camera"))
 
 
 def _extract_reward_info(env) -> dict:
@@ -560,6 +594,7 @@ def _build_single_episode_spec(args_cli) -> dict:
         "model_label": args_cli.model_label,
         "eval_model_path": args_cli.eval_model_path,
         "recording_save_dir": args_cli.recording_save_dir,
+        "vla_trace_path": os.environ.get("LEROBOT_VLA_TRACE_PATH", "").strip(),
         "max_steps": int(args_cli.max_steps),
     }
 
@@ -590,6 +625,7 @@ def _load_episode_specs(args_cli) -> list[dict]:
                 "model_label": str(entry.get("model_label", args_cli.model_label)),
                 "eval_model_path": str(entry.get("eval_model_path", args_cli.eval_model_path)),
                 "recording_save_dir": str(entry.get("recording_save_dir", args_cli.recording_save_dir)),
+                "vla_trace_path": str(entry.get("vla_trace_path", "")),
                 "max_steps": int(entry.get("max_steps", args_cli.max_steps)),
             }
         )
@@ -655,8 +691,6 @@ def _settle_scene_with_robot_pinned(env, settle_steps: int) -> None:
         env.sim.step(render=False)
         env.scene.update(dt=env.physics_dt)
 
-    # The last physics step can integrate the floating base once. Restore the exact
-    # episode reset state without resetting scene objects that have just settled.
     robot.write_root_pose_to_sim(root_pose)
     robot.write_root_velocity_to_sim(zero_root_velocity)
     robot.write_joint_state_to_sim(joint_pos, zero_joint_velocity)
@@ -666,8 +700,18 @@ def _settle_scene_with_robot_pinned(env, settle_steps: int) -> None:
     print("[sim_eval_vla] pre-policy settling complete; robot state restored")
 
 
+def _set_lerobot_trace_path(action_provider, trace_path: str) -> None:
+    client = getattr(action_provider, "_lerobot_http_client", None)
+    if client is None:
+        return
+    setter = getattr(client, "set_trace_path", None)
+    if not callable(setter):
+        raise RuntimeError("LeRobot HTTP client does not support per-episode trace paths")
+    setter(trace_path or None)
 
-def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: str, *, success: bool, failure_reason: str, step_idx: int, terminal_step_idx: int, final_reward: float, final_reward_scaled: float, max_reward: float, max_reward_scaled: float, video_path: str, started_at: float, error: str = "", terminal_detail: str = "", env=None) -> dict:
+
+
+def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: str, *, success: bool, failure_reason: str, step_idx: int, terminal_step_idx: int, final_reward: float, final_reward_scaled: float, max_reward: float, max_reward_scaled: float, video_path: str, third_person_video_path: str, started_at: float, error: str = "", terminal_detail: str = "", env=None) -> dict:
     from common_env_objects import get_current_episode_object_seed_info
 
     payload = {
@@ -687,14 +731,23 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "max_reward": 0.0 if max_reward == float("-inf") else float(max_reward),
         "max_reward_scaled": 0.0 if max_reward_scaled == float("-inf") else float(max_reward_scaled),
         "video_path": video_path,
+        "front_video_path": video_path,
+        "third_person_video_path": third_person_video_path,
         "video_recorded": bool(video_path),
+        "dual_video_recorded": bool(video_path and third_person_video_path),
+        "third_person_camera": {
+            "mode": "fixed_world",
+            "pose_source": "scene_config",
+            "resolution": [
+                int(args_cli.third_person_camera_image_width),
+                int(args_cli.third_person_camera_image_height),
+            ],
+        },
+        "vla_trace_path": str(spec.get("vla_trace_path", "")),
         "server_url": server_url,
         "sonic_vla_action_format": str(args_cli.sonic_vla_action_format),
         "sonic_raw107_body_source": str(args_cli.sonic_raw107_body_source),
         "sonic_raw_state_joint_order": str(args_cli.sonic_raw_state_joint_order),
-        "pre_policy_settle_steps": int(args_cli.pre_policy_settle_steps),
-        "server_n_action_steps": int(args_cli.server_n_action_steps),
-        "server_num_inference_steps": int(args_cli.server_num_inference_steps),
         "started_at": started_at,
         "finished_at": time.time(),
         "duration_sec": time.time() - started_at,
@@ -714,16 +767,28 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
     result_path = Path(spec["result_json"]).expanduser().resolve()
     success_video_dir = Path(spec["success_video_dir"]).expanduser().resolve()
     failure_video_dir = Path(spec["failure_video_dir"]).expanduser().resolve()
+    world_camera_success_video_dir = world_camera_video_dir(success_video_dir)
+    world_camera_failure_video_dir = world_camera_video_dir(failure_video_dir)
     record_video = _should_record_video(args_cli, spec)
+    recorders = {}
     if record_video:
-        success_video_dir.mkdir(parents=True, exist_ok=True)
-        failure_video_dir.mkdir(parents=True, exist_ok=True)
-        temp_video_path = result_path.parent / f"{episode_name}__tmp.mp4"
-        if temp_video_path.exists():
-            temp_video_path.unlink()
-        recorder = SimpleVideoRecorder(str(temp_video_path), fps=int(spec["video_fps"]))
-    else:
-        recorder = None
+        for video_dir in (
+            success_video_dir,
+            failure_video_dir,
+            world_camera_success_video_dir,
+            world_camera_failure_video_dir,
+        ):
+            video_dir.mkdir(parents=True, exist_ok=True)
+        temp_video_paths = {
+            "front": result_path.parent / f"{episode_name}__front__tmp.mp4",
+            "third_person": result_path.parent / f"{episode_name}__third_person__tmp.mp4",
+        }
+        for view_name, temp_video_path in temp_video_paths.items():
+            if temp_video_path.exists():
+                temp_video_path.unlink()
+            recorders[view_name] = SimpleVideoRecorder(
+                str(temp_video_path), fps=int(spec["video_fps"])
+            )
     started_at = time.time()
     step_idx = 0
     max_reward = float("-inf")
@@ -735,33 +800,31 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
     failure_reason = "unknown"
     terminal_detail = ""
     video_path = ""
+    third_person_video_path = ""
     post_termination_steps_remaining = 0
-    record_post_termination_steps = int(spec["post_termination_record_steps"]) if recorder is not None else 0
+    record_post_termination_steps = int(spec["post_termination_record_steps"]) if recorders else 0
     fall_detector = _build_fall_detector(env, args_cli)
     fall_streak = 0
 
     try:
         _reset_environment_for_episode(env, env_cfg, int(spec["episode_seed"]))
-        _settle_scene_with_robot_pinned(env, int(args_cli.pre_policy_settle_steps))
-        # Reset policy-side histories only after settling so no settling frame or
-        # provisional action can leak into the evaluated episode.
+        _settle_scene_with_robot_pinned(
+            env, int(os.environ.get("PRE_POLICY_SETTLE_STEPS", "0") or 0)
+        )
+        _set_lerobot_trace_path(action_provider, str(spec.get("vla_trace_path", "")))
         _reset_lerobot_runtime_seed(action_provider, int(spec["episode_seed"]))
         _notify_action_provider_env_reset(action_provider)
         controller.start()
 
-        if recorder is not None:
-            initial_frame = _capture_front_camera_rgb(env)
-            if initial_frame is not None:
-                recorder.add_frame(initial_frame)
+        if recorders:
+            env.sim.render()
+            _record_episode_video_frames(env, recorders)
 
         while simulation_app.is_running() and controller.is_running:
             controller.step()
             step_idx += 1
 
-            if recorder is not None:
-                frame = _capture_front_camera_rgb(env)
-                if frame is not None:
-                    recorder.add_frame(frame)
+            _record_episode_video_frames(env, recorders)
 
             if post_termination_steps_remaining > 0:
                 post_termination_steps_remaining -= 1
@@ -835,7 +898,13 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
 
         target_dir = success_video_dir if success else failure_video_dir
         video_suffix = "success" if success else failure_reason
-        video_path = _finalize_video(recorder, target_dir, episode_name, video_suffix)
+        video_path = _finalize_video(recorders.get("front"), target_dir, episode_name, video_suffix)
+        third_person_video_path = _finalize_video(
+            recorders.get("third_person"),
+            world_camera_success_video_dir if success else world_camera_failure_video_dir,
+            f"{episode_name}__third_person",
+            video_suffix,
+        )
         payload = _build_result_payload(
             args_cli,
             spec,
@@ -850,6 +919,7 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
             max_reward=max_reward,
             max_reward_scaled=max_reward_scaled,
             video_path=video_path,
+            third_person_video_path=third_person_video_path,
             started_at=started_at,
             terminal_detail=terminal_detail,
             env=env,
@@ -859,7 +929,13 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
     except KeyboardInterrupt:
         reason = _INTERRUPT_REASON or "KeyboardInterrupt"
         print(f"[sim_eval_vla] interrupted stop_reason={reason} control_step={step_idx}")
-        video_path = _finalize_video(recorder, failure_video_dir, episode_name, "interrupted")
+        video_path = _finalize_video(recorders.get("front"), failure_video_dir, episode_name, "interrupted")
+        third_person_video_path = _finalize_video(
+            recorders.get("third_person"),
+            world_camera_failure_video_dir,
+            f"{episode_name}__third_person",
+            "interrupted",
+        )
         payload = _build_result_payload(
             args_cli,
             spec,
@@ -874,6 +950,7 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
             max_reward=max_reward,
             max_reward_scaled=max_reward_scaled,
             video_path=video_path,
+            third_person_video_path=third_person_video_path,
             started_at=started_at,
             error=reason,
             env=env,
@@ -882,7 +959,13 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
         raise
     except Exception as exc:
         print(f"[sim_eval_vla] episode failed: {exc}")
-        video_path = _finalize_video(recorder, failure_video_dir, episode_name, "sim_error")
+        video_path = _finalize_video(recorders.get("front"), failure_video_dir, episode_name, "sim_error")
+        third_person_video_path = _finalize_video(
+            recorders.get("third_person"),
+            world_camera_failure_video_dir,
+            f"{episode_name}__third_person",
+            "sim_error",
+        )
         payload = _build_result_payload(
             args_cli,
             spec,
@@ -897,6 +980,7 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
             max_reward=max_reward,
             max_reward_scaled=max_reward_scaled,
             video_path=video_path,
+            third_person_video_path=third_person_video_path,
             started_at=started_at,
             error=str(exc),
             env=env,
@@ -908,21 +992,22 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
             controller.stop()
         except Exception as exc:
             print(f"[sim_eval_vla] controller stop failed: {exc}")
-        if recorder is not None:
+        for view_name, recorder in recorders.items():
             try:
                 recorder.close()
             except Exception as exc:
-                print(f"[sim_eval_vla] recorder close failed: {exc}")
+                print(f"[sim_eval_vla] {view_name} recorder close failed: {exc}")
             try:
                 recorder.clear()
             except Exception as exc:
-                print(f"[sim_eval_vla] recorder clear failed: {exc}")
+                print(f"[sim_eval_vla] {view_name} recorder clear failed: {exc}")
         _cleanup_episode_memory()
 
 
 def main() -> int:
     parser = _build_parser()
     args_cli = parser.parse_args()
+    _validate_third_person_camera_args(args_cli)
     _install_interrupt_handlers()
     _ensure_unique_multi_image_shm_name(args_cli)
     args_cli.enable_cameras = True
@@ -963,6 +1048,7 @@ def main() -> int:
             task_name=args_cli.task,
             route_name=args_cli.gmt_backend or args_cli.action_source,
         )
+        _ensure_third_person_camera_cfg(env_cfg, args_cli)
         _seed_runtime_rngs(int(first_spec["episode_seed"]))
         _configure_episode_seed_state(env_cfg, int(first_spec["episode_seed"]))
         print(

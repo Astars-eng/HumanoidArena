@@ -160,6 +160,8 @@ def _start_server(args, model_path: str, log_path: Path):
         cmd.append("--stretch-image-to-policy-shape")
     if args.server_disable_action_delta_refiner:
         cmd.append("--disable-action-delta-refiner")
+    if args.server_zero_inference_noise:
+        cmd.append("--zero-inference-noise")
     if args.server_scheme == "https":
         if not args.tls_cert_file or not args.tls_key_file:
             raise ValueError("HTTPS server requires --tls_cert_file and --tls_key_file")
@@ -775,6 +777,12 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Disable the Stream action delta refiner in the policy server.",
+    )
+    parser.add_argument(
+        "--server_zero_inference_noise",
+        action="store_true",
+        default=False,
+        help="Use an all-zero initial action-noise tensor for Stream inference.",
     )
     parser.add_argument("--server_host", type=str, default="127.0.0.1")
     parser.add_argument("--server_port", type=int, default=8443)

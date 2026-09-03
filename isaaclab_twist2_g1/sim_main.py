@@ -1315,7 +1315,11 @@ def main():
                     loop_count += 1
                     if not args_cli.replay_data:
                         # Only update state and reward every 10 loops to improve performance
-                        if loop_count % 10 == 0:
+                        # Re-recording is a local, deterministic replay.  Publishing the
+                        # full scene state is only needed by the live teleoperation DDS
+                        # client; with camera sensors present, serializing that state can
+                        # stall every tenth replay step for tens of seconds.
+                        if loop_count % 10 == 0 and not args_cli.record_during_replay:
                             try:
                                 env_state = env.scene.get_state()
                                 env_state_json = sim_state_to_json(env_state)
@@ -1331,7 +1335,11 @@ def main():
                                 raise e
                         # Check for reset command from Redis (from Pico controller)
                         try:
-                            reset_cmd_redis = read_reset_trigger(redis_client=redis_reset_client)
+                            reset_cmd_redis = (
+                                None
+                                if args_cli.record_during_replay
+                                else read_reset_trigger(redis_client=redis_reset_client)
+                            )
                             if loop_count % 50 == 0:
                                 print(f"[DEBUG] Checking Redis reset trigger... (value: {reset_cmd_redis})")
                             if reset_cmd_redis:
@@ -1369,7 +1377,11 @@ def main():
                         # Check for reset command from DDS (original method)
                         # print(f"reset_pose_dds: {reset_pose_dds}")
                         try:
-                            reset_pose_cmd = reset_pose_dds.get_reset_pose_command()
+                            reset_pose_cmd = (
+                                None
+                                if args_cli.record_during_replay
+                                else reset_pose_dds.get_reset_pose_command()
+                            )
                             # Debug: print when command is received
                             if reset_pose_cmd is not None:
                                 print(f"[DEBUG] Received reset command: {reset_pose_cmd}")

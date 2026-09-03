@@ -20,7 +20,7 @@
     {
       "name": "horizon",
       "values": [1, 2, 3, 4, 5],
-      "env": "SERVER_N_ACTION_STEPS"
+      "env": "SERVER_STREAM_EXECUTION_HORIZON"
     },
     {
       "name": "flow",

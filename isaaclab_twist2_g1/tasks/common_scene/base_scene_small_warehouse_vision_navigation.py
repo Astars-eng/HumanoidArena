@@ -174,8 +174,10 @@ class SmallWarehouseVisionNavigationSceneCfg(InteractiveSceneCfg):
 
     world_camera = CameraBaseCfg.get_world_camera_config(
         pos_offset=(0.45796, -1.01443, 2.42268),
-        rot_offset=(0.50211, 0.27898, 0.39756, 0.71555),
-        focal_length=12,
+        # Bias the fixed overview toward the robot's start while retaining the
+        # complete obstacle corridor and target area in frame.
+        rot_offset=(0.43462, 0.25432, 0.43634, 0.74567),
+        focal_length=10,
         horizontal_aperture=27,
         convention="opengl",
     )

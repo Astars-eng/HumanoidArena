@@ -282,6 +282,9 @@ def _build_failure_result(args, server_url: str, run_dir: Path, task_spec: dict,
         'max_reward_scaled': 0.0,
         'video_path': '',
         'server_url': server_url,
+        'sonic_raw107_hand_mode': args.sonic_raw107_hand_mode,
+        'act_new107_execute_steps': args.act_new107_execute_steps,
+        'sonic_raw107_smooth_alpha': args.sonic_raw107_smooth_alpha,
         'log_path': str(sim_log),
         'returncode': -1,
         'error': str(exc),
@@ -442,6 +445,23 @@ def main() -> int:
         choices=['native_decoder', 'direct_raw'],
     )
     parser.add_argument(
+        '--sonic_raw107_hand_mode',
+        type=str,
+        default='policy',
+        choices=['policy', 'open'],
+    )
+    parser.add_argument(
+        '--act_new107_execute_steps',
+        type=int,
+        default=25,
+        choices=range(1, 26),
+    )
+    parser.add_argument(
+        '--sonic_raw107_smooth_alpha',
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
         '--sonic_raw_state_joint_order',
         type=str,
         default='sonic',
@@ -472,6 +492,8 @@ def main() -> int:
     parser.add_argument('--disable_gpu_lock', action='store_true', default=False)
     args = parser.parse_args()
 
+    if not 0.0 < float(args.sonic_raw107_smooth_alpha) <= 1.0:
+        parser.error('--sonic_raw107_smooth_alpha must be in (0, 1]')
     if args.num_workers <= 0:
         raise ValueError('--num_workers must be >= 1')
     if args.num_workers != 1:

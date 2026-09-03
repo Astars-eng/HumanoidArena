@@ -115,8 +115,9 @@ class TableFootballSceneCfgWH(InteractiveSceneCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=0.0),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
             physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=0.7,
-                dynamic_friction=0.5,
+                friction_combine_mode="max",
+                static_friction=1.0,
+                dynamic_friction=1.0,
                 restitution=0.1,
             ),
         ),

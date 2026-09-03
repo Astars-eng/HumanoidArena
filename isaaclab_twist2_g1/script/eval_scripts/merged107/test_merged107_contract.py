@@ -12,7 +12,12 @@ def _write_checkpoint(tmp_path: Path, family: str) -> Path:
     policy_dir = tmp_path / f"{family}_run" / "checkpoints" / "100000" / "pretrained_model"
     policy_dir.mkdir(parents=True)
     config = {
-        "type": {"act": "act", "dp": "diffusion", "flowmatching": "multi_task_dit"}[family],
+        "type": {
+            "act": "act",
+            "dp": "diffusion",
+            "flowmatching": "multi_task_dit",
+            "pi05": "pi05",
+        }[family],
         "objective": "flow_matching" if family == "flowmatching" else None,
         "n_obs_steps": 1,
         "n_action_steps": 20,
@@ -25,12 +30,12 @@ def _write_checkpoint(tmp_path: Path, family: str) -> Path:
             for key, shape in EXPECTED_OUTPUT_SHAPES.items()
         },
     }
-    if family == "act":
+    if family in {"act", "pi05"}:
         config["chunk_size"] = 20
     else:
         config["horizon"] = 24 if family == "dp" else 40
     preprocessor = {"steps": []}
-    if family == "flowmatching":
+    if family in {"flowmatching", "pi05"}:
         preprocessor["steps"].append(
             {"registry_name": "tokenizer_processor", "config": {"task_key": "task"}}
         )
@@ -41,7 +46,7 @@ def _write_checkpoint(tmp_path: Path, family: str) -> Path:
     return policy_dir
 
 
-@pytest.mark.parametrize("family", ["act", "dp", "flowmatching"])
+@pytest.mark.parametrize("family", ["act", "dp", "flowmatching", "pi05"])
 def test_accepts_all_merged_policy_families(tmp_path: Path, family: str) -> None:
     policy_dir = _write_checkpoint(tmp_path, family)
     assert validate_checkpoint(policy_dir)["_merged107_family"] == family
@@ -64,4 +69,23 @@ def test_flowmatching_requires_task_tokenizer(tmp_path: Path) -> None:
     (policy_dir / "policy_preprocessor.json").write_text('{"steps": []}', encoding="utf-8")
 
     with pytest.raises(ValueError, match="tokenizer_processor"):
+        validate_checkpoint(policy_dir)
+
+
+def test_pi05_requires_task_tokenizer(tmp_path: Path) -> None:
+    policy_dir = _write_checkpoint(tmp_path, "pi05")
+    (policy_dir / "policy_preprocessor.json").write_text('{"steps": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="tokenizer_processor"):
+        validate_checkpoint(policy_dir)
+
+
+def test_pi05_rejects_execution_horizon_larger_than_chunk(tmp_path: Path) -> None:
+    policy_dir = _write_checkpoint(tmp_path, "pi05")
+    config_path = policy_dir / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["n_action_steps"] = 21
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not exceed chunk_size"):
         validate_checkpoint(policy_dir)

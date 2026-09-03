@@ -27,6 +27,7 @@ from tasks.common_scene.base_scene_football_single_cfg_wholebody import (
     ROBOT_INIT_X,
     ROBOT_INIT_Y,
     ROBOT_INIT_Z,
+    CENTER_CIRCLE_RADIUS,
 )
 
 GOAL_REFERENCE_LINE_RELATIVE_OFFSETS = (
@@ -252,6 +253,7 @@ class MoveFootballG129Dex3WholebodyEnvCfg(ManagerBasedRLEnvCfg):
             stage = omni.usd.get_context().get_stage()
             create_simple_debug_lines(
                 stage,
+                circle_radius=CENTER_CIRCLE_RADIUS,
                 line_color=(1.0, 1.0, 1.0),
                 draw_goal_reference_lines=True,
                 goal_centers=GOAL_REFERENCE_LINE_ABSOLUTE_CENTERS,
@@ -287,3 +289,52 @@ class MoveFootballG129Dex3WholebodyEnvCfg(ManagerBasedRLEnvCfg):
                 print(f"[semantic_basketball] reset skipped: {exc}")
         except Exception as exc:
             print(f"[football_runtime] post-reset grass skipped: {exc}")
+
+    def debug_after_startup_reset(self, env, args_cli=None):
+        """Enforce the replay floor pose and a freely simulated football.
+
+        The scene cfg already requests these values, but the referenced ball USD
+        and reset layers can author stronger opinions.  Apply the final values
+        after the recorded episode initial state has been restored so replay is
+        guaranteed to start on a level pitch with a non-kinematic ball.
+        """
+        del args_cli
+        try:
+            ground = env.scene["ground"]
+            ground_state = ground.data.root_state_w.clone()
+            ground_state[:, 0:3] = torch.tensor(
+                [0.0, 0.0, -0.005], device=ground_state.device, dtype=ground_state.dtype
+            )
+            ground_state[:, 3:7] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0], device=ground_state.device, dtype=ground_state.dtype
+            )
+            ground_state[:, 7:13] = 0.0
+            ground.write_root_state_to_sim(ground_state)
+
+            from pxr import PhysxSchema, Usd, UsdPhysics
+
+            stage = env.sim.stage
+            ball_root = stage.GetPrimAtPath("/World/envs/env_0/Object")
+            dynamic_prims = []
+            if ball_root and ball_root.IsValid():
+                for prim in Usd.PrimRange(ball_root):
+                    if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                        continue
+                    rigid_api = UsdPhysics.RigidBodyAPI(prim)
+                    rigid_api.CreateRigidBodyEnabledAttr(True).Set(True)
+                    rigid_api.CreateKinematicEnabledAttr(False).Set(False)
+                    physx_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                    physx_api.CreateDisableGravityAttr(False).Set(False)
+                    dynamic_prims.append(str(prim.GetPath()))
+
+            ball = env.scene["object"]
+            ball_state = ball.data.root_state_w
+            print(
+                "[football_replay_physics] "
+                f"ground_pos={ground_state[0, 0:3].detach().cpu().tolist()} "
+                f"ground_quat_wxyz={ground_state[0, 3:7].detach().cpu().tolist()} "
+                f"ball_pos={ball_state[0, 0:3].detach().cpu().tolist()} "
+                f"dynamic_ball_prims={dynamic_prims}"
+            )
+        except Exception as exc:
+            print(f"[football_replay_physics] enforcement failed: {exc}")
