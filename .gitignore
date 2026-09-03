@@ -69,3 +69,5 @@ MEMORY.md
 /HumanoidArena_dataset_v3_1
 /pi05_doubledesk_100000
 /humanoidarena_assets_isaaclab_twist2_g1_20260703_release_clean.zip
+eval_results_old/
+eval_results/
