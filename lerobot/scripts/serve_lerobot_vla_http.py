@@ -254,6 +254,25 @@ def _normalize_portable_stream_config(payload):
 
     updated = dict(payload)
     changed = False
+    future_flag = "action_delta_refiner_use_future_action_context"
+    body_only = "action_delta_refiner_body_only"
+    if body_only in updated:
+        if updated[body_only] is not False:
+            raise ValueError("Enabled body-only refiner requires a compatible Stream implementation")
+        updated.pop(body_only)
+        changed = True
+        print("[lerobot_vla_server] drop disabled body-only refiner export field", flush=True)
+    future_dim = "action_delta_refiner_future_action_context_dim"
+    if future_flag in updated or future_dim in updated:
+        if updated.get(future_flag, False):
+            # The deployed Stream fork supports GRU and window future context.
+            # Preserve architecture fields so saved weights load correctly.
+            print("[lerobot_vla_server] preserve enabled future-action-context fields", flush=True)
+        else:
+            updated.pop(future_flag, None)
+            updated.pop(future_dim, None)
+            changed = True
+            print("[lerobot_vla_server] drop disabled future-action-context export fields", flush=True)
     for field_name, empty_value in (
         ("action_expert_state_keys", []),
         ("state_key_dims", {}),

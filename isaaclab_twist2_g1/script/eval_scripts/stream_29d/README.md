@@ -77,8 +77,9 @@ bash isaaclab_twist2_g1/script/eval_scripts/stream_29d/run_vla_eval_parallel.sh
 - `SERVER_ACTION_DELTA_REFINER_WEIGHT=1.0`：执行 `base + weight * refiner_delta`；`0` 为 base action，`1` 为 checkpoint 原始 refiner 输出。
 - `SERVER_ZERO_INFERENCE_NOISE=1`：将 Stream 推理的初始 action noise 设为全零；默认仍为标准高斯采样。
 - `SONIC_RAW_STATE_JOINT_ORDER=mujoco`：当前 29D contract 的默认关节顺序，不应随意覆盖。
-- `PRE_POLICY_SETTLE_STEPS=N`：每局 reset 后固定机器人并仅推进 `N` 个 PhysX 步，待动态物体
-  沉降后再清空 VLA 历史、录制第一帧并开始正式计步；默认 `0`（关闭）。
+- 策略前物理沉降已移除：不再读取 `PRE_POLICY_SETTLE_STEPS`，reset 后不固定机器人或额外推进物理。
+  `run_config.json.pre_policy_settle_steps` 固定为 `0`，仅兼容历史结果读取。
+- `VIDEO_FPS` 默认 `50`，与每个 50 Hz 控制步采集一帧匹配，避免视频慢放；视频 FPS 写入评测结果。
 
 ## 双视角录像
 

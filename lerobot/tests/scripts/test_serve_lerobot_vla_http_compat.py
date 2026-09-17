@@ -15,6 +15,47 @@ SERVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SERVER)
 
 
+def test_disabled_body_only_export_is_removed():
+    payload = {"type": "stream", "action_delta_refiner_body_only": False}
+    normalized, changed = SERVER._normalize_portable_stream_config(payload)
+    assert normalized == {"type": "stream"}
+    assert changed is True
+    assert payload["action_delta_refiner_body_only"] is False
+
+
+def test_enabled_body_only_is_not_silently_removed():
+    with pytest.raises(ValueError, match="body-only"):
+        SERVER._normalize_portable_stream_config(
+            {"type": "stream", "action_delta_refiner_body_only": True}
+        )
+
+
+@pytest.mark.parametrize("mode", ["window", "gru"])
+def test_enabled_future_context_preserves_architecture(mode):
+    payload = {
+        "type": "stream",
+        "action_delta_refiner_use_future_action_context": True,
+        "action_delta_refiner_future_action_context_dim": 128,
+        "action_delta_refiner_future_action_context_mode": mode,
+    }
+    normalized, changed = SERVER._normalize_portable_stream_config(payload)
+    assert normalized == payload
+    assert changed is False
+
+
+def test_disabled_future_context_exports_are_removed_without_mutating_source():
+    payload = {
+        "type": "stream",
+        "action_delta_refiner_use_future_action_context": False,
+        "action_delta_refiner_future_action_context_dim": 128,
+    }
+    normalized, changed = SERVER._normalize_portable_stream_config(payload)
+    assert normalized == {"type": "stream"}
+    assert changed is True
+    assert payload["action_delta_refiner_use_future_action_context"] is False
+    assert payload["action_delta_refiner_future_action_context_dim"] == 128
+
+
 def test_pi05_export_fields_are_removed_only_in_compat_copy(tmp_path: Path) -> None:
     policy_dir = tmp_path / "pretrained_model"
     policy_dir.mkdir()
