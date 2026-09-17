@@ -47,10 +47,27 @@ def _select_available_server_port(host: str, start_port: int, max_port: int) -> 
     raise RuntimeError(f"No free server port found from {start_port} to {max_port}")
 
 
-def _select_server_port(host: str, requested_port: int, max_port: int, mode: str) -> int:
+def _select_server_port(
+    host: str,
+    requested_port: int,
+    max_port: int,
+    mode: str,
+    *,
+    fixed_port_wait_s: float = 60.0,
+) -> int:
     if mode == "fixed":
-        if not _is_port_available(host, requested_port):
-            raise RuntimeError(f"Requested fixed server port is occupied: {host}:{requested_port}")
+        # Consecutive persistent batches reuse the same fixed port. The prior
+        # HTTP server can take a short time to release its listening socket
+        # after termination, so wait instead of turning every job in the next
+        # seed into a synthetic worker_error.
+        deadline = time.monotonic() + max(0.0, float(fixed_port_wait_s))
+        while not _is_port_available(host, requested_port):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Requested fixed server port remained occupied for "
+                    f"{fixed_port_wait_s:.1f}s: {host}:{requested_port}"
+                )
+            time.sleep(0.25)
         return requested_port
     return _select_available_server_port(host, requested_port, max_port)
 
@@ -407,6 +424,10 @@ def _worker_run(task_spec: dict, args_dict: dict, run_dir_str: str) -> list[dict
         except Exception:
             if server_proc is not None:
                 server_proc.kill()
+                try:
+                    server_proc.wait(timeout=10.0)
+                except Exception:
+                    pass
         try:
             if server_log_fp is not None:
                 server_log_fp.close()
