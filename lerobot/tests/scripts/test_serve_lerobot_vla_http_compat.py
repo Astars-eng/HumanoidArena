@@ -15,6 +15,22 @@ SERVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SERVER)
 
 
+def test_null_refiner_action_dim_is_removed_without_mutating_source():
+    payload = {"type": "stream", "action_delta_refiner_action_dim": None}
+    normalized, changed = SERVER._normalize_portable_stream_config(payload)
+    assert normalized == {"type": "stream"}
+    assert changed is True
+    assert "action_delta_refiner_action_dim" in payload
+
+
+@pytest.mark.parametrize("dimension", [0, 29, 32, False, "29"])
+def test_explicit_refiner_action_dim_is_not_silently_removed(dimension):
+    with pytest.raises(ValueError, match="action_delta_refiner_action_dim"):
+        SERVER._normalize_portable_stream_config(
+            {"type": "stream", "action_delta_refiner_action_dim": dimension}
+        )
+
+
 def test_disabled_body_only_export_is_removed():
     payload = {"type": "stream", "action_delta_refiner_body_only": False}
     normalized, changed = SERVER._normalize_portable_stream_config(payload)

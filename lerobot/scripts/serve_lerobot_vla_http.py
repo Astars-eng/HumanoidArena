@@ -274,6 +274,9 @@ def _normalize_portable_stream_config(payload):
             changed = True
             print("[lerobot_vla_server] drop disabled future-action-context export fields", flush=True)
     for field_name, empty_value in (
+        # Null means no dimension override; the deployed fork derives it from
+        # action features. Never drop an explicit architecture override.
+        ("action_delta_refiner_action_dim", None),
         ("action_expert_state_keys", []),
         ("state_key_dims", {}),
     ):
