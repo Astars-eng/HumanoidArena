@@ -14,6 +14,7 @@ SONIC_RAW_POLICY_STATE_DIM = 64
 SONIC_RAW_POLICY_ACTION_DIM = 107
 SONIC_RAW95_POLICY_ACTION_DIM = 95
 SONIC_RAW29_POLICY_ACTION_DIM = 29
+SONIC_RAW43_POLICY_ACTION_DIM = 43
 SONIC_RAW_BODY_ACTION_DIM = 29
 SONIC_RAW_ENCODER_TOKEN_DIM = 64
 SONIC_RAW_HAND_ACTION_DIM = 7
@@ -96,6 +97,28 @@ class SonicRawPolicyAction:
     encoder_token: np.ndarray
     left_hand: np.ndarray
     right_hand: np.ndarray
+
+
+@dataclass(frozen=True)
+class SonicRaw43PolicyAction:
+    """Named views of a Stream ``body29 + left7 + right7`` action."""
+
+    body_raw: np.ndarray
+    left_hand: np.ndarray
+    right_hand: np.ndarray
+
+
+def split_sonic_raw43_policy_action(action: np.ndarray) -> SonicRaw43PolicyAction:
+    """Split a raw43 action while preserving the trained joint order and units."""
+
+    vector = _finite_vector(action, SONIC_RAW43_POLICY_ACTION_DIM, "SONIC raw43 policy action")
+    body_end = SONIC_RAW_BODY_ACTION_DIM
+    left_end = body_end + SONIC_RAW_HAND_ACTION_DIM
+    return SonicRaw43PolicyAction(
+        body_raw=vector[:body_end].copy(),
+        left_hand=vector[body_end:left_end].copy(),
+        right_hand=vector[left_end:].copy(),
+    )
 
 
 @dataclass(frozen=True)

@@ -16,6 +16,7 @@ from action_provider.sonic_raw_policy_adapter import (
     select_sonic_raw107_hand_targets,
     sonic_raw_body_to_joint_targets,
     split_sonic_raw95_policy_action,
+    split_sonic_raw43_policy_action,
     split_sonic_raw_policy_action,
 )
 
@@ -39,6 +40,20 @@ def test_split_sonic_raw_policy_action_preserves_all_dimensions():
     np.testing.assert_array_equal(split.encoder_token, action[29:93])
     np.testing.assert_array_equal(split.left_hand, action[93:100])
     np.testing.assert_array_equal(split.right_hand, action[100:107])
+
+
+def test_split_sonic_raw43_policy_action_preserves_body_and_dex3_targets():
+    action = np.arange(43, dtype=np.float32)
+    split = split_sonic_raw43_policy_action(action)
+
+    np.testing.assert_array_equal(split.body_raw, action[:29])
+    np.testing.assert_array_equal(split.left_hand, action[29:36])
+    np.testing.assert_array_equal(split.right_hand, action[36:43])
+    with pytest.raises(ValueError, match="shape"):
+        split_sonic_raw43_policy_action(action[:29])
+    action[42] = np.nan
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        split_sonic_raw43_policy_action(action)
 
 
 def test_select_raw107_policy_hand_targets_preserves_predictions():

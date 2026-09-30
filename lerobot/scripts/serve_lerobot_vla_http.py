@@ -254,9 +254,22 @@ def _normalize_portable_stream_config(payload):
 
     updated = dict(payload)
     changed = False
+
+    if updated.get("action_delta_refiner_body_only") is True:
+        _stream_body43_refiner_dim(updated)
+        updated.pop("action_delta_refiner_body_only")
+        changed = True
+        print(
+            "[lerobot_vla_server] load Stream body43 checkpoint with its 29-D body refiner",
+            flush=True,
+        )
+
     for field_name, empty_value in (
         ("action_expert_state_keys", []),
         ("state_key_dims", {}),
+        ("action_delta_refiner_body_only", False),
+        ("action_delta_refiner_action_dim", None),
+        ("scheduler_auto_scale_to_training_steps", True),
     ):
         if field_name not in updated:
             continue
@@ -287,6 +300,101 @@ def _normalize_portable_stream_config(payload):
         )
 
     return updated, changed
+
+
+def _stream_body43_refiner_dim(config: dict) -> int:
+    """Validate the specific 43-D Action Expert / 29-D Refiner layout."""
+
+    keys = config.get("action_keys")
+    dims = config.get("action_key_dims") or {}
+    body_dim = dims.get("action.applied_action")
+    valid = (
+        config.get("type") == "stream"
+        and keys == ["action.applied_action", "action.left_hand", "action.right_hand"]
+        and dims == {"action.applied_action": 29, "action.left_hand": 7, "action.right_hand": 7}
+        and config.get("max_action_dim") == 43
+        and config.get("action_delta_refiner_enabled") is True
+        and config.get("action_delta_refiner_architecture") == "legacy_mlp"
+        and config.get("action_delta_refiner_input_mode") == "action"
+        and config.get("action_delta_refiner_output_mode") == "delta"
+        and config.get("action_delta_refiner_action_dim") is None
+        and set(config.get("action_delta_refiner_limits") or {}) == {"action.applied_action"}
+    )
+    if not valid:
+        raise ValueError("Unsupported Stream action_delta_refiner_body_only layout")
+    return int(body_dim)
+
+
+def _load_stream_body43_policy(policy_cls, policy_dir: Path, config):
+    """Load a 29-D body Refiner while preserving the Action Expert's 43-D output."""
+
+    from lerobot.policies.stream import modeling_stream
+    from lerobot.policies.stream.action_delta_refiner import ActionDeltaMLP, make_action_delta_limits
+
+    body_dim = int(config.action_key_dims["action.applied_action"])
+    action_dim = int(config.max_action_dim)
+    original_factory = modeling_stream.make_action_refiner
+    original_reconcile = policy_cls._reconcile_action_delta_refiner_state_dict
+
+    def make_body_refiner(refiner_config):
+        if refiner_config is not config:
+            return original_factory(refiner_config)
+        limits = make_action_delta_limits(refiner_config)
+        if tuple(limits.shape) != (action_dim,) or torch.any(limits[body_dim:] != 0):
+            raise ValueError("Stream body43 hand refiner limits must be zero")
+        return ActionDeltaMLP(
+            action_dim=body_dim,
+            state_dim=refiner_config.max_state_dim,
+            history_steps=refiner_config.action_delta_refiner_num_history_frames,
+            hidden_dims=refiner_config.action_delta_refiner_hidden_dims,
+            delta_limits=limits[:body_dim],
+            output_mode=refiner_config.action_delta_refiner_output_mode,
+            output_dim=body_dim,
+            vlm_token_dim=(refiner_config.vlm_embedding_dim if refiner_config.action_delta_refiner_use_vlm_token else 0),
+            vlm_token_compression_dim=(
+                refiner_config.action_delta_refiner_vlm_token_compression_dim
+                if refiner_config.action_delta_refiner_vlm_token_compression_enabled else None
+            ),
+            future_action_context_dim=(
+                refiner_config.action_delta_refiner_future_action_context_dim
+                if refiner_config.action_delta_refiner_use_future_action_context else 0
+            ),
+            future_action_context_mode=refiner_config.action_delta_refiner_future_action_context_mode,
+            future_action_window_size=refiner_config.action_delta_refiner_future_action_window_size,
+        )
+
+    def reconcile_body_refiner(remapped_state_dict, checkpoint_refiner_state, target_refiner_state):
+        key = "model.action_delta_refiner.delta_limits"
+        limits = checkpoint_refiner_state.get(key)
+        if limits is None or tuple(limits.shape) != (1, 1, action_dim) or torch.any(limits[..., body_dim:] != 0):
+            raise ValueError("Stream body43 checkpoint has incompatible hand refiner limits")
+        checkpoint_refiner_state[key] = limits[..., :body_dim].clone()
+        remapped_state_dict[key] = checkpoint_refiner_state[key]
+        return original_reconcile(remapped_state_dict, checkpoint_refiner_state, target_refiner_state)
+
+    modeling_stream.make_action_refiner = make_body_refiner
+    policy_cls._reconcile_action_delta_refiner_state_dict = staticmethod(reconcile_body_refiner)
+    try:
+        policy = policy_cls.from_pretrained(policy_dir, config=config)
+    finally:
+        modeling_stream.make_action_refiner = original_factory
+        policy_cls._reconcile_action_delta_refiner_state_dict = staticmethod(original_reconcile)
+
+    refiner = policy.model.action_delta_refiner
+    if not isinstance(refiner, ActionDeltaMLP) or refiner.output.out_features != body_dim:
+        raise ValueError("Stream body43 Refiner did not load its 29-D output head")
+    original_forward = refiner.forward
+
+    def forward_with_hand_zero_delta(base_action, state_history, *args, **kwargs):
+        if base_action.shape[-1] != action_dim:
+            raise ValueError(f"Expected {action_dim}-D Action Expert output, got {tuple(base_action.shape)}")
+        body_delta = original_forward(base_action[..., :body_dim], state_history, *args, **kwargs)
+        if body_delta.shape[-1] != body_dim:
+            raise ValueError(f"Expected {body_dim}-D body Refiner output, got {tuple(body_delta.shape)}")
+        return torch.nn.functional.pad(body_delta, (0, action_dim - body_dim))
+
+    refiner.forward = forward_with_hand_zero_delta
+    return policy
 
 
 def _normalize_portable_pi05_config(payload, policy_dir: Path):
@@ -813,6 +921,8 @@ def _load_policy(
         # under lerobot.common while keeping the same call contract.
         from lerobot.common.control_utils import predict_action
 
+    raw_config = json.loads((policy_dir / "config.json").read_text())
+    body43_refiner = raw_config.get("type") == "stream" and raw_config.get("action_delta_refiner_body_only") is True
     compat_dir_ctx, effective_policy_dir = _prepare_compat_policy_dir(policy_dir)
 
     config = PreTrainedConfig.from_pretrained(effective_policy_dir)
@@ -830,7 +940,10 @@ def _load_policy(
 
     policy_cls = get_policy_class(config.type)
 
-    policy = policy_cls.from_pretrained(effective_policy_dir, config=config)
+    policy = (
+        _load_stream_body43_policy(policy_cls, effective_policy_dir, config)
+        if body43_refiner else policy_cls.from_pretrained(effective_policy_dir, config=config)
+    )
     if disable_action_delta_refiner:
         _disable_stream_action_delta_refiner(policy)
     else:

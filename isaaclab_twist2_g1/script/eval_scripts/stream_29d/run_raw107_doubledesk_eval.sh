@@ -18,7 +18,7 @@ else
 fi
 
 export ENV_CONFIG_YAML="${ENV_CONFIG_YAML:-tasks/common_test_config/base_test/doubledesk_sonic_test.yaml}"
-export SONIC_VLA_ACTION_FORMAT="raw29"
+export SONIC_VLA_ACTION_FORMAT="${SONIC_VLA_ACTION_FORMAT:-raw29}"
 # raw29 is an open-loop decoder raw action; it has no motion-token branch.
 export SONIC_RAW107_BODY_SOURCE="${SONIC_RAW107_BODY_SOURCE:-direct_raw}"
 # [parameter tuning] Pin the pre-existing optional delay to the neutral value so

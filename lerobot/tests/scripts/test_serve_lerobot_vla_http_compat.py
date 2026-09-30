@@ -56,6 +56,60 @@ def test_non_pi05_config_is_unchanged(tmp_path: Path) -> None:
     assert changed is False
 
 
+def test_stream_legacy_empty_refiner_fields_are_removed() -> None:
+    payload = {
+        "type": "stream",
+        "chunk_size": 25,
+        "action_delta_refiner_body_only": False,
+        "action_delta_refiner_action_dim": None,
+    }
+
+    normalized, changed = SERVER._normalize_portable_stream_config(payload)
+
+    assert normalized == {"type": "stream", "chunk_size": 25}
+    assert changed is True
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("action_delta_refiner_body_only", True),
+        ("action_delta_refiner_action_dim", 29),
+    ],
+)
+def test_stream_nonempty_legacy_refiner_fields_are_rejected(
+    field_name: str, value: object
+) -> None:
+    payload = {"type": "stream", field_name: value}
+
+    with pytest.raises(ValueError, match=field_name):
+        SERVER._normalize_portable_stream_config(payload)
+
+
+def test_stream_body43_checkpoint_keeps_hand_actions_in_action_expert() -> None:
+    payload = {
+        "type": "stream",
+        "action_keys": ["action.applied_action", "action.left_hand", "action.right_hand"],
+        "action_key_dims": {"action.applied_action": 29, "action.left_hand": 7, "action.right_hand": 7},
+        "max_action_dim": 43,
+        "action_delta_refiner_enabled": True,
+        "action_delta_refiner_architecture": "legacy_mlp",
+        "action_delta_refiner_input_mode": "action",
+        "action_delta_refiner_output_mode": "delta",
+        "action_delta_refiner_action_dim": None,
+        "action_delta_refiner_body_only": True,
+        "action_delta_refiner_limits": {"action.applied_action": 0.5},
+    }
+
+    normalized, changed = SERVER._normalize_portable_stream_config(payload)
+
+    assert changed is True
+    assert normalized["action_keys"] == payload["action_keys"]
+    assert normalized["max_action_dim"] == 43
+    assert "action_delta_refiner_body_only" not in normalized
+    assert "action_delta_refiner_action_dim" not in normalized
+
+
 def test_act_execution_steps_override_action_queue_length() -> None:
     config = SimpleNamespace(type="act", chunk_size=25, n_action_steps=25)
 

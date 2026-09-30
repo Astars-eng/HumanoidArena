@@ -91,7 +91,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sonic_vla_action_format",
         type=str,
         default=os.environ.get("SONIC_VLA_ACTION_FORMAT", "raw29"),
-        choices=["raw29", "semantic_v3", "latent64", "raw107"],
+        choices=["raw29", "raw43", "semantic_v3", "latent64", "raw107"],
     )
     parser.add_argument(
         "--sonic_raw107_body_source",
@@ -200,7 +200,7 @@ def _normalize_control_routing(args):
     args.enable_wholebody_dds = True
     args.enable_dex1_dds = False
     # Keep Dex3 joints active, but do not create/subscribe to the Dex3 DDS
-    # command channel: raw107 action[93:107] is the sole hand command source.
+    # command channel: the policy's predicted hand joints are the sole hand command source.
     args.enable_dex3_dds = False
     args.enable_dex3_model_control = True
     args.enable_inspire_dds = False

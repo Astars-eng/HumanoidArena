@@ -762,7 +762,7 @@ def main() -> int:
         "--sonic_vla_action_format",
         type=str,
         default=os.environ.get("SONIC_VLA_ACTION_FORMAT", "raw29"),
-        choices=["raw29", "semantic_v3", "latent64", "raw107"],
+        choices=["raw29", "raw43", "semantic_v3", "latent64", "raw107"],
         help="Policy/SONIC action interface contract.",
     )
     parser.add_argument(

@@ -6,6 +6,7 @@ import concurrent.futures
 import fcntl
 import json
 import math
+import os
 import socket
 import time
 from pathlib import Path
@@ -445,7 +446,7 @@ def main() -> int:
         default=26.0,
         help="Clamp max root orientation delta per step (degrees). <=0 to disable.",
     )
-    parser.add_argument('--sonic_vla_action_format', type=str, default='raw29', choices=['raw29'])
+    parser.add_argument('--sonic_vla_action_format', type=str, default='raw29', choices=['raw29', 'raw43'])
     parser.add_argument(
         '--sonic_raw107_body_source',
         type=str,
@@ -520,7 +521,7 @@ def main() -> int:
         raise ValueError('--server_port_max must be within [server_port_base, 65535]')
 
     for model_path in args.model_paths:
-        validate_checkpoint(model_path)
+        validate_checkpoint(model_path, args.sonic_vla_action_format)
 
     run_dir = Path(args.results_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)

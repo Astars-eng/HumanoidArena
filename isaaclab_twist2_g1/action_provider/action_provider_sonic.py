@@ -63,6 +63,7 @@ from action_provider.reset_control import (
 )
 from action_provider.sonic_raw_policy_adapter import (
     SONIC_RAW29_POLICY_ACTION_DIM,
+    SONIC_RAW43_POLICY_ACTION_DIM,
     SONIC_RAW95_POLICY_ACTION_DIM,
     SONIC_RAW107_HAND_MODES,
     SONIC_RAW_POLICY_ACTION_DIM,
@@ -73,6 +74,7 @@ from action_provider.sonic_raw_policy_adapter import (
     reorder_mujoco_joint_vector_to_sonic,
     select_sonic_raw107_hand_targets,
     sonic_raw_body_to_joint_targets,
+    split_sonic_raw43_policy_action,
     split_sonic_raw95_policy_action,
     split_sonic_raw_policy_action,
 )
@@ -1557,6 +1559,8 @@ class SonicActionProvider(ActionProvider):
             self._vla_action_format = "latent64"
         elif self._vla_action_format in {"raw29", "sonic_raw29", "decoder_raw29"}:
             self._vla_action_format = "raw29"
+        elif self._vla_action_format in {"raw43", "sonic_raw43"}:
+            self._vla_action_format = "raw43"
         elif self._vla_action_format in {"raw", "raw107", "sonic_raw107", "decoder_raw107"}:
             self._vla_action_format = "raw107"
         elif self._vla_action_format in {"raw95", "sonic_raw95", "act95"}:
@@ -1564,11 +1568,14 @@ class SonicActionProvider(ActionProvider):
         else:
             raise ValueError(
                 f"[SonicActionProvider] Unsupported SONIC_VLA_ACTION_FORMAT={self._vla_action_format!r}; "
-                "expected semantic_v3, latent64, raw29, raw95, or raw107"
+                "expected semantic_v3, latent64, raw29, raw43, raw95, or raw107"
             )
         self._use_vla_latent64 = self._use_lerobot_vla and self._vla_action_format == "latent64"
         self._use_vla_raw107 = self._use_lerobot_vla and self._vla_action_format == "raw107"
+        self._use_vla_raw43 = self._use_lerobot_vla and self._vla_action_format == "raw43"
         self._use_vla_raw29 = self._use_lerobot_vla and self._vla_action_format == "raw29"
+        # Both formats use the same 93-D DFS/MuJoCo observation and body map.
+        self._use_vla_raw_body93 = self._use_vla_raw29 or self._use_vla_raw43
         self._use_vla_raw95 = self._use_lerobot_vla and self._vla_action_format == "raw95"
         self._vla_state_format = str(
             getattr(args_cli, "sonic_vla_state_format", os.environ.get("SONIC_VLA_STATE_FORMAT", "rotlocal_v3"))
@@ -1629,7 +1636,7 @@ class SonicActionProvider(ActionProvider):
         # robot_type='g1'.  Keep the physical HumanoidArena robot identifier
         # separate from the metadata supplied to the policy.
         self._lerobot_robot_type = "g1" if (
-            self._use_vla_raw29
+            self._use_vla_raw_body93
             or self._use_vla_raw107
             or self._use_vla_raw64_state
             or self._use_vla_raw93_state
@@ -1874,7 +1881,7 @@ class SonicActionProvider(ActionProvider):
         if self._use_vla_raw107:
             print(f"[SonicActionProvider] raw107 hand mode={self._raw107_hand_mode}")
         if (
-            self._use_vla_raw29
+            self._use_vla_raw_body93
             or self._use_vla_raw107
             or self._use_vla_raw64_state
             or self._use_vla_raw93_state
@@ -2400,14 +2407,16 @@ class SonicActionProvider(ActionProvider):
         state_shape = tuple(getattr(state_feature, "shape", ()) or ())
         action_shape = tuple(getattr(action_feature, "shape", ()) or ())
         expected_state_shape = (
-            (93,) if (self._use_vla_raw29 or self._use_vla_raw93_state) else (SONIC_VLA_STATE_DIM,)
+            (93,) if (self._use_vla_raw_body93 or self._use_vla_raw93_state) else (SONIC_VLA_STATE_DIM,)
         )
         if state_shape and state_shape != expected_state_shape:
             raise ValueError(
                 f"[SonicActionProvider] VLA policy must use observation.state shape {expected_state_shape}, "
                 f"got {state_shape}"
             )
-        if self._use_vla_raw29:
+        if self._use_vla_raw43:
+            expected_action_shapes = {(SONIC_RAW43_POLICY_ACTION_DIM,)}
+        elif self._use_vla_raw29:
             expected_action_shapes = {(SONIC_RAW29_POLICY_ACTION_DIM,)}
         elif self._use_vla_raw107:
             expected_action_shapes = {(SONIC_RAW_POLICY_ACTION_DIM,)}
@@ -2612,7 +2621,7 @@ class SonicActionProvider(ActionProvider):
         # the same values reordered to DFS/MuJoCo.
         joint_pos = robot.joint_pos[0, self._sonic_idx].cpu().numpy().astype(np.float32)
         joint_vel = robot.joint_vel[0, self._sonic_idx].cpu().numpy().astype(np.float32)
-        if self._use_vla_raw29 or self._raw_state_joint_order == "mujoco":
+        if self._use_vla_raw_body93 or self._raw_state_joint_order == "mujoco":
             joint_pos = reorder_sonic_joint_vector_to_mujoco(joint_pos, "joint_pos")
             joint_vel = reorder_sonic_joint_vector_to_mujoco(joint_vel, "joint_vel")
         ang_vel_b = robot.root_ang_vel_b[0].cpu().numpy().astype(np.float32)
@@ -2624,7 +2633,7 @@ class SonicActionProvider(ActionProvider):
             ang_vel_b=ang_vel_b,
             gravity=gravity,
         )
-        if not (self._use_vla_raw29 or self._use_vla_raw93_state):
+        if not (self._use_vla_raw_body93 or self._use_vla_raw93_state):
             return state64, components
         components["observation.last_action"] = self._vla_last_raw_action_dfs.copy()
         state93 = np.concatenate([state64, components["observation.last_action"]]).astype(np.float32)
@@ -2633,7 +2642,7 @@ class SonicActionProvider(ActionProvider):
     def _fetch_lerobot_action_chunk(self) -> np.ndarray:
         rgb = self._get_front_camera_rgb_for_vla()
         if (
-            self._use_vla_raw29
+            self._use_vla_raw_body93
             or self._use_vla_raw107
             or self._use_vla_raw64_state
             or self._use_vla_raw93_state
@@ -2644,7 +2653,7 @@ class SonicActionProvider(ActionProvider):
             state_components = None
         if self._lerobot_http_client is not None:
             if (
-                self._use_vla_raw29
+                self._use_vla_raw_body93
                 or self._use_vla_raw107
                 or self._use_vla_raw64_state
                 or self._use_vla_raw93_state
@@ -2697,7 +2706,9 @@ class SonicActionProvider(ActionProvider):
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         if action_chunk.ndim == 1:
             action_chunk = action_chunk.reshape(1, -1)
-        if self._use_vla_raw29:
+        if self._use_vla_raw43:
+            expected_dims = {SONIC_RAW43_POLICY_ACTION_DIM}
+        elif self._use_vla_raw29:
             expected_dims = {SONIC_RAW29_POLICY_ACTION_DIM}
         elif self._use_vla_raw107:
             expected_dims = {SONIC_RAW_POLICY_ACTION_DIM}
@@ -2739,6 +2750,24 @@ class SonicActionProvider(ActionProvider):
         self._latest_vla_action = action_dfs.copy()
         self._vla_last_raw_action_dfs = action_dfs.copy()
         action_sonic = reorder_mujoco_joint_vector_to_sonic(action_dfs, "raw29_action_dfs")
+        target_sonic = sonic_raw_body_to_joint_targets(
+            action_sonic,
+            action_scale=G1_ACTION_SCALE_ISAACLAB,
+            default_joint_pos=self._sonic_default_np,
+        )
+        self._latest_decoder_raw_action = action_sonic.copy()
+        self._latest_decoder_target = target_sonic.copy()
+        return target_sonic
+
+    def _run_gear_sonic_raw43_from_vla(self) -> np.ndarray:
+        """Execute body29 and continuous Dex3 hand7+7 predictions."""
+        action = self._pop_lerobot_action()
+        split = split_sonic_raw43_policy_action(action)
+        self._latest_vla_action = action.copy()
+        self._vla_last_raw_action_dfs = split.body_raw.copy()
+        self._left_hand_target[:] = split.left_hand
+        self._right_hand_target[:] = split.right_hand
+        action_sonic = reorder_mujoco_joint_vector_to_sonic(split.body_raw, "raw43_action_body")
         target_sonic = sonic_raw_body_to_joint_targets(
             action_sonic,
             action_scale=G1_ACTION_SCALE_ISAACLAB,
@@ -3060,6 +3089,8 @@ class SonicActionProvider(ActionProvider):
         return target_sonic
 
     def _run_gear_sonic_from_vla(self) -> np.ndarray:
+        if self._use_vla_raw43:
+            return self._run_gear_sonic_raw43_from_vla()
         if self._use_vla_raw29:
             return self._run_gear_sonic_raw29_from_vla()
         if self._use_vla_raw107:
@@ -3114,7 +3145,7 @@ class SonicActionProvider(ActionProvider):
             self._sonic_default_np[np.newaxis], (_STEP1_FRAMES, 1))  # (10, 29)
 
         # 手部关节目标
-        if self._use_vla_raw29:
+        if self._use_vla_raw_body93:
             self._left_hand_target = np.asarray(
                 DEFAULT_HAND_POSE[SONIC_HAND_POSE_ROBOT_NAME]["left"]["open"], dtype=np.float32
             ).copy()
