@@ -254,21 +254,38 @@ def _normalize_portable_stream_config(payload):
 
     updated = dict(payload)
     changed = False
-
-    if updated.get("action_delta_refiner_body_only") is True:
-        _stream_body43_refiner_dim(updated)
-        updated.pop("action_delta_refiner_body_only")
+    future_flag = "action_delta_refiner_use_future_action_context"
+    body_only = "action_delta_refiner_body_only"
+    if body_only in updated:
+        if updated[body_only] is True:
+            _stream_body43_refiner_dim(updated)
+            print(
+                "[lerobot_vla_server] load Stream body43 checkpoint with its 29-D body refiner",
+                flush=True,
+            )
+        elif updated[body_only] is False:
+            print("[lerobot_vla_server] drop disabled body-only refiner export field", flush=True)
+        else:
+            raise ValueError("Unsupported body-only Stream action_delta_refiner_body_only value")
+        updated.pop(body_only)
         changed = True
-        print(
-            "[lerobot_vla_server] load Stream body43 checkpoint with its 29-D body refiner",
-            flush=True,
-        )
-
+    future_dim = "action_delta_refiner_future_action_context_dim"
+    if future_flag in updated or future_dim in updated:
+        if updated.get(future_flag, False):
+            # The deployed Stream fork supports GRU and window future context.
+            # Preserve architecture fields so saved weights load correctly.
+            print("[lerobot_vla_server] preserve enabled future-action-context fields", flush=True)
+        else:
+            updated.pop(future_flag, None)
+            updated.pop(future_dim, None)
+            changed = True
+            print("[lerobot_vla_server] drop disabled future-action-context export fields", flush=True)
     for field_name, empty_value in (
+        # Null means no dimension override; the deployed fork derives it from
+        # action features. Never drop an explicit architecture override.
+        ("action_delta_refiner_action_dim", None),
         ("action_expert_state_keys", []),
         ("state_key_dims", {}),
-        ("action_delta_refiner_body_only", False),
-        ("action_delta_refiner_action_dim", None),
         ("scheduler_auto_scale_to_training_steps", True),
     ):
         if field_name not in updated:
@@ -321,7 +338,7 @@ def _stream_body43_refiner_dim(config: dict) -> int:
         and set(config.get("action_delta_refiner_limits") or {}) == {"action.applied_action"}
     )
     if not valid:
-        raise ValueError("Unsupported Stream action_delta_refiner_body_only layout")
+        raise ValueError("Unsupported body-only Stream action_delta_refiner_body_only layout")
     return int(body_dim)
 
 

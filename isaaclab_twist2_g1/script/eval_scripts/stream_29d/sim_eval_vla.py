@@ -110,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result_json", type=str, default="")
     parser.add_argument("--success_video_dir", type=str, default="")
     parser.add_argument("--failure_video_dir", type=str, default="")
-    parser.add_argument("--video_fps", type=int, default=30)
+    parser.add_argument("--video_fps", type=int, default=50)
     parser.add_argument("--post_termination_record_steps", type=int, default=0)
     parser.add_argument("--record_video_every_n", type=int, default=1)
     parser.add_argument("--third_person_camera_image_width", type=int, default=1280)
@@ -666,40 +666,6 @@ def _reset_lerobot_runtime_seed(action_provider, episode_seed: int):
         client.reset(seed=int(episode_seed))
 
 
-def _settle_scene_with_robot_pinned(env, settle_steps: int) -> None:
-    """Advance dynamic scene objects while keeping the robot at its reset state."""
-    steps = int(settle_steps)
-    if steps <= 0:
-        return
-
-    robot = env.scene["robot"]
-    root_state = robot.data.root_state_w.detach().clone()
-    root_pose = root_state[:, :7].clone()
-    zero_root_velocity = torch.zeros_like(root_state[:, 7:13])
-    joint_pos = robot.data.joint_pos.detach().clone()
-    zero_joint_velocity = torch.zeros_like(robot.data.joint_vel)
-
-    print(
-        f"[sim_eval_vla] pre-policy settling start physics_steps={steps} "
-        f"duration_sec={steps * float(env.physics_dt):.3f} robot_pinned=1"
-    )
-    for _ in range(steps):
-        robot.write_root_pose_to_sim(root_pose)
-        robot.write_root_velocity_to_sim(zero_root_velocity)
-        robot.write_joint_state_to_sim(joint_pos, zero_joint_velocity)
-        env.scene.write_data_to_sim()
-        env.sim.step(render=False)
-        env.scene.update(dt=env.physics_dt)
-
-    robot.write_root_pose_to_sim(root_pose)
-    robot.write_root_velocity_to_sim(zero_root_velocity)
-    robot.write_joint_state_to_sim(joint_pos, zero_joint_velocity)
-    env.scene.write_data_to_sim()
-    env.scene.update(dt=0.0)
-    env.sim.render()
-    print("[sim_eval_vla] pre-policy settling complete; robot state restored")
-
-
 def _set_lerobot_trace_path(action_provider, trace_path: str) -> None:
     client = getattr(action_provider, "_lerobot_http_client", None)
     if client is None:
@@ -726,6 +692,7 @@ def _build_result_payload(args_cli, spec: dict, model_label: str, server_url: st
         "failure_reason": failure_reason,
         "episode_steps": int(terminal_step_idx or step_idx),
         "max_steps": int(spec["max_steps"]),
+        "video_fps": int(spec["video_fps"]),
         "final_reward": float(final_reward),
         "final_reward_scaled": float(final_reward_scaled),
         "max_reward": 0.0 if max_reward == float("-inf") else float(max_reward),
@@ -808,9 +775,6 @@ def _run_episode_once(simulation_app, env, env_cfg, action_provider, controller,
 
     try:
         _reset_environment_for_episode(env, env_cfg, int(spec["episode_seed"]))
-        _settle_scene_with_robot_pinned(
-            env, int(os.environ.get("PRE_POLICY_SETTLE_STEPS", "0") or 0)
-        )
         _set_lerobot_trace_path(action_provider, str(spec.get("vla_trace_path", "")))
         _reset_lerobot_runtime_seed(action_provider, int(spec["episode_seed"]))
         _notify_action_provider_env_reset(action_provider)

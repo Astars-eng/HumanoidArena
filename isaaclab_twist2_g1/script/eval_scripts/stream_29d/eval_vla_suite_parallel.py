@@ -48,10 +48,27 @@ def _select_available_server_port(host: str, start_port: int, max_port: int) -> 
     raise RuntimeError(f"No free server port found from {start_port} to {max_port}")
 
 
-def _select_server_port(host: str, requested_port: int, max_port: int, mode: str) -> int:
+def _select_server_port(
+    host: str,
+    requested_port: int,
+    max_port: int,
+    mode: str,
+    *,
+    fixed_port_wait_s: float = 60.0,
+) -> int:
     if mode == "fixed":
-        if not _is_port_available(host, requested_port):
-            raise RuntimeError(f"Requested fixed server port is occupied: {host}:{requested_port}")
+        # Consecutive persistent batches reuse the same fixed port. The prior
+        # HTTP server can take a short time to release its listening socket
+        # after termination, so wait instead of turning every job in the next
+        # seed into a synthetic worker_error.
+        deadline = time.monotonic() + max(0.0, float(fixed_port_wait_s))
+        while not _is_port_available(host, requested_port):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Requested fixed server port remained occupied for "
+                    f"{fixed_port_wait_s:.1f}s: {host}:{requested_port}"
+                )
+            time.sleep(0.25)
         return requested_port
     return _select_available_server_port(host, requested_port, max_port)
 
@@ -408,6 +425,10 @@ def _worker_run(task_spec: dict, args_dict: dict, run_dir_str: str) -> list[dict
         except Exception:
             if server_proc is not None:
                 server_proc.kill()
+                try:
+                    server_proc.wait(timeout=10.0)
+                except Exception:
+                    pass
         try:
             if server_log_fp is not None:
                 server_log_fp.close()
@@ -424,7 +445,7 @@ def main() -> int:
     parser.add_argument('--repeats_per_seed', type=int, default=1)
     parser.add_argument('--persistent_sim', type=int, default=0)
     parser.add_argument('--max_steps', type=int, required=True)
-    parser.add_argument('--video_fps', type=int, default=30)
+    parser.add_argument('--video_fps', type=int, default=50)
     parser.add_argument('--post_termination_record_steps', type=int, default=0)
     parser.add_argument('--record_video_every_n', type=int, default=1)
     parser.add_argument('--third_person_camera_image_width', type=int, default=1280)
@@ -534,6 +555,7 @@ def main() -> int:
         'seeds': [int(seed) for seed in args.seeds],
         'repeats_per_seed': int(args.repeats_per_seed),
         'max_steps': int(args.max_steps),
+        'video_fps': int(args.video_fps),
         'persistent_sim': bool(args.persistent_sim),
         'server_task_mode': 'verbatim' if args.server_verbatim_task else 'mapped',
         'server_verbatim_task': bool(args.server_verbatim_task),
@@ -542,7 +564,7 @@ def main() -> int:
         'server_action_delta_refiner_weight': float(args.server_action_delta_refiner_weight),
         'server_zero_inference_noise': bool(args.server_zero_inference_noise),
         'server_disable_action_delta_refiner': bool(args.server_disable_action_delta_refiner),
-        'pre_policy_settle_steps': int(os.environ.get('PRE_POLICY_SETTLE_STEPS', '0') or 0),
+        'pre_policy_settle_steps': 0,
         'server_devices': _resolve_server_devices(args),
         'isaac_device': str(args.isaac_device),
     }

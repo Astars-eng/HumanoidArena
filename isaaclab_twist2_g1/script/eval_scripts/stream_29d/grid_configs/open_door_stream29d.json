@@ -30,8 +30,7 @@
   ],
   "fixed_env": {
     "SERVER_DISABLE_ACTION_DELTA_REFINER": "{DISABLE_REFINER}",
-    "SERVER_VERBATIM_TASK": "0",
-    "PRE_POLICY_SETTLE_STEPS": "0"
+    "SERVER_VERBATIM_TASK": "0"
   },
   "seeds": "0 1 2",
   "repeats_per_seed": 20,
